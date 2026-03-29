@@ -1,0 +1,21 @@
+{
+  "name": "listing-pipeline",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "ingest": "tsx cli/ingest.ts",
+    "list-bucket-images": "tsx cli/list-bucket-images.ts",
+    "bundles": "tsx cli/call-edge.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "@types/node": "^22.10.2"
+  }
+}

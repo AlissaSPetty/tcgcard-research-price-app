@@ -1,0 +1,7 @@
+node_modules
+.history/
+.env
+.env.local
+dist
+.DS_Store
+supabase/edge-secrets.env
