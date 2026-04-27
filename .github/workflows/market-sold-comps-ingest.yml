@@ -1,5 +1,5 @@
-# POST /functions/v1/market-comps-ingest on a schedule (UTC).
-# Secrets: SUPABASE_MARKET_COMPS_INGEST_URL, LISTING_CRON_SECRET
+# POST /functions/v1/market-sold-comps-ingest on a schedule (UTC).
+# Secrets: SUPABASE_MARKET_SOLD_COMPS_INGEST_URL, LISTING_CRON_SECRET
 
 name: Market sold comps ingest
 
