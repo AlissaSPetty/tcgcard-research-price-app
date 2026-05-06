@@ -6,7 +6,10 @@
   "scripts": {
     "ingest": "tsx cli/ingest.ts",
     "list-bucket-images": "tsx cli/list-bucket-images.ts",
-    "bundles": "tsx cli/call-edge.ts"
+    "bundles": "tsx cli/call-edge.ts",
+    "refresh-pokemon-cards": "tsx cli/refresh-pokemon-card-images.ts",
+    "market-comps-ingest": "tsx cli/run-market-comps-ingest.ts",
+    "market-sold-comps-ingest": "tsx cli/run-market-sold-comps-ingest.ts"
   },
   "engines": {
     "node": ">=20"
@@ -15,6 +18,7 @@
     "@supabase/supabase-js": "^2.49.1"
   },
   "devDependencies": {
+    "dotenv": "^16.4.7",
     "tsx": "^4.19.2",
     "@types/node": "^22.10.2"
   }
