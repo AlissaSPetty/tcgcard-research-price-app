@@ -1,0 +1,100 @@
+# POST /functions/v1/market-sold-comps-ingest on a schedule (UTC).
+# Secrets: SUPABASE_MARKET_SOLD_COMPS_INGEST_URL, LISTING_CRON_SECRET
+# Stagger from active BIN ingest (e.g. 02:00 UTC) — Finding API sold comps.
+
+name: Market sold comps ingest
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      order:
+        description: "stale (default keyset) or id (legacy offset; set offset below)"
+        required: false
+        default: "stale"
+      offset:
+        description: "Only for order=id — starting row offset"
+        required: false
+        default: "0"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: market-sold-comps-ingest
+      cancel-in-progress: false
+    steps:
+      - name: POST market-sold-comps-ingest until completed
+        env:
+          URL: ${{ secrets.SUPABASE_MARKET_SOLD_COMPS_INGEST_URL }}
+          SECRET: ${{ secrets.LISTING_CRON_SECRET }}
+          ORDER_IN: ${{ github.event_name == 'workflow_dispatch' && inputs.order || 'stale' }}
+          START_OFFSET: ${{ github.event_name == 'workflow_dispatch' && inputs.offset || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$URL" ] || [ -z "$SECRET" ]; then
+            echo "Missing SUPABASE_MARKET_SOLD_COMPS_INGEST_URL or LISTING_CRON_SECRET repository secrets."
+            exit 1
+          fi
+          ORDER="${ORDER_IN:-stale}"
+          OFFSET="${START_OFFSET:-0}"
+          if ! [[ "$OFFSET" =~ ^[0-9]+$ ]]; then
+            echo "offset must be a non-negative integer, got: $OFFSET"
+            exit 1
+          fi
+          BATCH=0
+          CURSOR_LAST=""
+          CURSOR_ID=""
+          while true; do
+            BATCH=$((BATCH + 1))
+            if [ "$ORDER" = "id" ]; then
+              echo "=== Invocation $BATCH (order=id offset=$OFFSET) ==="
+              BODY=$(jq -n --argjson o "$OFFSET" '{order: "id", offset: $o}')
+            elif [ -z "$CURSOR_ID" ] && [ -z "$CURSOR_LAST" ]; then
+              echo "=== Invocation $BATCH (order=stale, first page) ==="
+              BODY='{"order":"stale"}'
+            else
+              echo "=== Invocation $BATCH (order=stale cursor) ==="
+              BODY=$(jq -n --arg la "$CURSOR_LAST" --arg id "$CURSOR_ID" '{order: "stale", cursorLastAt: $la, cursorId: $id}')
+            fi
+            RESP=$(curl -sS -f -X POST "$URL" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-secret: $SECRET" \
+              -d "$BODY")
+            echo "$RESP"
+            ERR=$(echo "$RESP" | jq -r '.error // empty')
+            if [ -n "$ERR" ]; then
+              echo "Edge function error: $ERR"
+              exit 1
+            fi
+            COMPLETED=$(echo "$RESP" | jq -r 'if .completed == true then "true" else "false" end')
+            if [ "$COMPLETED" = "true" ]; then
+              echo "market-sold-comps-ingest completed after $BATCH invocation(s)."
+              break
+            fi
+            if [ "$ORDER" = "id" ]; then
+              NEXT=$(echo "$RESP" | jq -r 'if .nextOffset == null then empty else .nextOffset end')
+              if [ -z "$NEXT" ] || [ "$NEXT" = "null" ]; then
+                echo "market-sold-comps-ingest stopped: missing nextOffset after batch $BATCH."
+                exit 1
+              fi
+              OFFSET=$NEXT
+            else
+              LA=$(echo "$RESP" | jq -r '.nextCursor.lastAt // empty')
+              CID=$(echo "$RESP" | jq -r '.nextCursor.id // empty')
+              PARTIAL=$(echo "$RESP" | jq -r 'if .partial == true then "true" else "false" end')
+              if [ -z "$LA" ] || [ -z "$CID" ] || [ "$LA" = "null" ] || [ "$CID" = "null" ]; then
+                if [ "$PARTIAL" = "true" ]; then
+                  CURSOR_LAST=""
+                  CURSOR_ID=""
+                else
+                  echo "market-sold-comps-ingest stopped: missing nextCursor after batch $BATCH (partial=false)."
+                  exit 1
+                fi
+              else
+                CURSOR_LAST="$LA"
+                CURSOR_ID="$CID"
+              fi
+            fi
+          done

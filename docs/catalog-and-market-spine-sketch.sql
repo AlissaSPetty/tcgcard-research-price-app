@@ -1,0 +1,151 @@
+-- =============================================================================
+-- DESIGN SKETCH ONLY — not applied by Supabase migrations.
+-- Goal: multi-vertical catalog + eBay comps without rewriting pokemon_* / market_*.
+-- =============================================================================
+--
+-- Current prod (keep as-is):
+--   pokemon_card_images  ← catalog spine for Pokémon TCG
+--   market_rss_cards, market_sold_comps, market_rss_active_observations,
+--   market_sold_comp_snapshots, pokemon_card_market_refresh
+--   → all keyed by pokemon_card_image_id (uuid)
+--
+-- Strategy:
+--   1) Introduce a GENERIC spine `catalog_item` for non-Pokémon (and optional future join).
+--   2) Add NEW market tables that reference `catalog_item_id` only (parallel to today's tables).
+--   3) Optionally later: nullable `catalog_item_id` on pokemon_card_images + backfill, OR leave
+--      Pokémon on pokemon_card_image_id forever and only use catalog_item for other verticals.
+--
+-- Reference: TCGdex / tcgcsv for Pokémon; Steam RAWG / IGDB / manual SKU for games; BGG for board games.
+
+-- ---------------------------------------------------------------------------
+-- Vertical registry (extensible without enum churn)
+-- ---------------------------------------------------------------------------
+-- create table public.catalog_vertical (
+--   slug text primary key,  -- 'pokemon_tcg', 'video_game', 'board_game'
+--   label text not null,
+--   sort_order int not null default 0,
+--   created_at timestamptz not null default now()
+-- );
+
+-- ---------------------------------------------------------------------------
+-- Generic catalog row (one uuid spine per sellable identity)
+-- ---------------------------------------------------------------------------
+-- create table public.catalog_item (
+--   id uuid primary key default gen_random_uuid(),
+--
+--   vertical_slug text not null references public.catalog_vertical (slug),
+--
+--   -- Stable identity from upstream (your ingest chooses convention).
+--   external_source text not null,  -- 'tcgcsv', 'steam', 'bgg', 'manual'
+--   external_id text not null,       -- product id, app id, geek id, etc.
+--
+--   title text not null,
+--   subtitle text,                  -- edition, region, platform label
+--   image_url text,
+--
+--   -- Vertical-specific facts without schema forks (indexes optional via expression).
+--   attributes jsonb not null default '{}'::jsonb,
+--   -- examples: {"platform":"Switch","region":"US"}, {"player_count":[2,4]}
+--
+--   metadata_source text,           -- provenance / last ingest job
+--   created_at timestamptz not null default now(),
+--   updated_at timestamptz not null default now(),
+--
+--   unique (vertical_slug, external_source, external_id)
+-- );
+--
+-- create index idx_catalog_item_vertical_title on public.catalog_item (vertical_slug, lower(title));
+
+-- ---------------------------------------------------------------------------
+-- Optional later: link Pokémon rows to the spine (no requirement to ship this first)
+-- ---------------------------------------------------------------------------
+-- alter table public.pokemon_card_images
+--   add column if not exists catalog_item_id uuid references public.catalog_item (id);
+-- create unique index uidx_pokemon_card_images_catalog_item
+--   on public.pokemon_card_images (catalog_item_id)
+--   where catalog_item_id is not null;
+
+-- ---------------------------------------------------------------------------
+-- Variant dimension (replaces Pokémon-only enum for new verticals)
+-- ---------------------------------------------------------------------------
+-- Today: market_rss_card_type enum ('Normal','Holo',...)
+-- New verticals: free-form or controlled per vertical.
+--
+-- Option A — text key checked in app / CHECK per vertical:
+--   variant_key text not null  -- 'cib', 'loose', 'graded', 'digital'
+--
+-- Option B — reference table:
+-- create table public.catalog_variant_kind (
+--   vertical_slug text not null references public.catalog_vertical (slug),
+--   variant_key text not null,
+--   label text not null,
+--   primary key (vertical_slug, variant_key)
+-- );
+
+-- ---------------------------------------------------------------------------
+-- NEW parallel “active BIN comp” aggregate (generic sibling of market_rss_cards)
+-- ---------------------------------------------------------------------------
+-- One row per (catalog_item, variant). Same conceptual role as market_rss_cards for Pokémon.
+--
+-- create table public.market_catalog_comp_active (
+--   id uuid primary key default gen_random_uuid(),
+--   catalog_item_id uuid not null references public.catalog_item (id) on delete cascade,
+--   variant_key text not null,
+--
+--   search_fingerprint text,        -- normalized query / hash for dedupe & debugging
+--   average_price_cents int,
+--   price_cents_history jsonb not null default '[]'::jsonb,
+--   updated_at timestamptz not null default now(),
+--
+--   unique (catalog_item_id, variant_key)
+-- );
+
+-- ---------------------------------------------------------------------------
+-- NEW parallel sold aggregate (generic sibling of market_sold_comps)
+-- ---------------------------------------------------------------------------
+-- create table public.market_catalog_comp_sold (
+--   id uuid primary key default gen_random_uuid(),
+--   catalog_item_id uuid not null references public.catalog_item (id) on delete cascade,
+--   variant_key text not null,
+--
+--   average_price_cents int,
+--   sample_size int not null default 0 check (sample_size >= 0),
+--   updated_at timestamptz not null default now(),
+--
+--   unique (catalog_item_id, variant_key)
+-- );
+
+-- ---------------------------------------------------------------------------
+-- NEW append-only observation rows (optional; mirrors market_rss_active_observations)
+-- ---------------------------------------------------------------------------
+-- create table public.market_catalog_active_observations (
+--   id uuid primary key default gen_random_uuid(),
+--   catalog_item_id uuid not null references public.catalog_item (id) on delete cascade,
+--   variant_key text not null,
+--   ebay_item_id text,
+--   observed_at timestamptz not null default now(),
+--   price_cents int not null,
+--   shipping jsonb,
+--   source text not null default 'browse'
+-- );
+
+-- ---------------------------------------------------------------------------
+-- Refresh cadence (generic sibling of pokemon_card_market_refresh)
+-- ---------------------------------------------------------------------------
+-- create table public.catalog_item_market_refresh (
+--   catalog_item_id uuid primary key references public.catalog_item (id) on delete cascade,
+--   refresh_tier text not null default 'normal',  -- or reuse enum when shared
+--   next_active_refresh_at timestamptz not null default 'epoch'::timestamptz,
+--   next_sold_refresh_at timestamptz not null default 'epoch'::timestamptz,
+--   last_active_ingest_at timestamptz,
+--   last_sold_ingest_at timestamptz,
+--   updated_at timestamptz not null default now()
+-- );
+
+-- =============================================================================
+-- Rollout notes (still “no rewrite”)
+-- =============================================================================
+-- • Ship catalog_vertical + catalog_item + market_catalog_* first; wire ingest + Edge for ONE new vertical.
+-- • Pokémon keeps using pokemon_card_image_id everywhere until you explicitly add catalog_item_id + dual-write.
+-- • UI: filter by vertical_slug; comps RPCs branch on vertical or separate endpoints.
+-- • tcgplayer_price_snapshots / pokemon-specific views stay unchanged.
