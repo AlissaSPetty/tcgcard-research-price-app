@@ -1,27 +1,14 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { ebayClientCredentialsToken } from "../_shared/listing/ebay_market.ts";
 import {
-  ebayClientCredentialsToken,
-  searchBrowseBinListings,
-} from "../_shared/listing/ebay_market.ts";
-import {
-  canonicalMarketRssTitle,
   ebayCompSearchQuery,
   MARKET_COMP_FINISHES,
   type PokemonCardCompSource,
 } from "../_shared/listing/market_comps.ts";
+import { ingestOneCardMarketComps } from "../_shared/listing/market_comps_ingest_card.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
-import {
-  appendShippingRing,
-  appendUniquePriceRing,
-  averagePriceCents,
-  isSameMarketListingUrl,
-  priceHistoryFromJson,
-  shippingAverageFromHistory,
-  shippingHistoryFromJson,
-  shippingHistoryToJson,
-  type MarketCardType,
-} from "../_shared/listing/rss_market.ts";
+import type { MarketCardType } from "../_shared/listing/rss_market.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -65,20 +52,6 @@ function ebayAppCredentials(): { appId: string; certId: string } | null {
   return { appId: appId.trim(), certId: certId.trim() };
 }
 
-type DbMarketRow = {
-  id: string;
-  listing_url: string | null;
-  ebay_item_id: string | null;
-  price_cents_history: unknown;
-  shipping_history: unknown;
-  average_price_cents: number | null;
-  previous_average_price_cents: number | null;
-  shipping_average_free: boolean;
-  shipping_average_cents: number | null;
-  listed_date: string | null;
-  card_name: string | null;
-};
-
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: cors });
@@ -90,6 +63,26 @@ Deno.serve(async (req) => {
   if (!(await authOk(req))) {
     return json({ error: "Unauthorized" }, 401);
   }
+
+  let body: {
+    offset?: number;
+    cursorLastAt?: string | null;
+    cursorId?: string | null;
+    /** `stale` = keyset by last comp time (default). `id` = legacy offset pagination by id. */
+    order?: "stale" | "id";
+  } = {};
+  try {
+    const t = await req.text();
+    if (t) body = JSON.parse(t) as typeof body;
+  } catch {
+    body = {};
+  }
+
+  const orderMode =
+    body.order ??
+      (Deno.env.get("MARKET_COMPS_ORDER")?.trim().toLowerCase() === "id"
+        ? "id"
+        : "stale");
 
   const creds = ebayAppCredentials();
   if (!creds) {
@@ -107,220 +100,209 @@ Deno.serve(async (req) => {
     return json({ error: (e as Error).message }, 502);
   }
 
+  /** Smaller batches + caps reduce Edge WORKER_LIMIT (CPU time). Inner loop does 1+ DB round-trips per Browse listing. */
+  const rawBatch = Number(Deno.env.get("MARKET_COMPS_BATCH_SIZE") ?? "1");
   const batchSize = Math.min(
-    200,
-    Math.max(1, Number(Deno.env.get("MARKET_COMPS_BATCH_SIZE") ?? "15")),
+    20,
+    Math.max(1, Number.isFinite(rawBatch) ? rawBatch : 1),
   );
-  const offset = Math.max(
+  const envOffset = Math.max(
     0,
     Number(Deno.env.get("MARKET_COMPS_OFFSET") ?? "0"),
   );
-  const browseLimit = Math.min(
-    50,
-    Math.max(1, Number(Deno.env.get("MARKET_COMPS_BROWSE_LIMIT") ?? "25")),
-  );
-  const delayMs = Math.max(
+  const offset = Math.max(
     0,
-    Number(Deno.env.get("MARKET_COMPS_SEARCH_DELAY_MS") ?? "150"),
+    Number.isFinite(body.offset) ? Math.floor(body.offset!) : envOffset,
   );
 
-  const { data: pokemonRows, error: pErr } = await admin
-    .from("pokemon_card_images")
-    .select("id, name, card_set, card_number")
-    .order("id", { ascending: true })
-    .range(offset, offset + batchSize - 1);
+  /** Keyset cursor for stale-first mode (replay on partial). */
+  const requestCursorLastAt =
+    typeof body.cursorLastAt === "string" && body.cursorLastAt.trim() !== ""
+      ? body.cursorLastAt.trim()
+      : null;
+  const requestCursorId =
+    typeof body.cursorId === "string" && body.cursorId.trim() !== ""
+      ? body.cursorId.trim()
+      : null;
+  const rawMaxSearches = Number(Deno.env.get("MARKET_COMPS_MAX_SEARCHES") ?? "3");
+  const maxSearches = Math.min(
+    200,
+    Math.max(
+      3,
+      Number.isFinite(rawMaxSearches) ? rawMaxSearches : 3,
+    ),
+  );
+  const rawBrowse = Number(Deno.env.get("MARKET_COMPS_BROWSE_LIMIT") ?? "10");
+  const browseLimit = Math.min(
+    50,
+    Math.max(1, Number.isFinite(rawBrowse) ? rawBrowse : 10),
+  );
+  const rawMaxListings = Number(
+    Deno.env.get("MARKET_COMPS_MAX_LISTINGS_PER_SEARCH") ?? "3",
+  );
+  const maxListingsPerSearch = Math.min(
+    browseLimit,
+    Math.max(1, Number.isFinite(rawMaxListings) ? rawMaxListings : 5),
+  );
+  /** Space Browse calls to reduce eBay API errorId 2001 / "Too many requests" (0 = no delay). */
+  const delayMs = Math.max(
+    0,
+    Number(Deno.env.get("MARKET_COMPS_SEARCH_DELAY_MS") ?? "1500"),
+  );
+
+  let pokemonRows: Record<string, unknown>[] | null = null;
+  let pErr: { message: string } | null = null;
+  /** Last row sort_ts in stale mode (for nextCursor). */
+  let lastSortTs: string | null = null;
+  let lastRowId: string | null = null;
+
+  if (orderMode === "stale") {
+    const { data, error } = await admin.rpc("market_comps_next_cards", {
+      p_cursor_last_at: requestCursorLastAt,
+      p_cursor_id: requestCursorId,
+      p_limit: batchSize,
+    });
+    pErr = error;
+    const rows = (data ?? []) as Array<{
+      id: string;
+      name: string | null;
+      card_set: string | null;
+      card_number: string | null;
+      sort_ts?: string;
+    }>;
+    pokemonRows = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      card_set: r.card_set,
+      card_number: r.card_number,
+    }));
+    const last = rows[rows.length - 1];
+    if (last) {
+      lastSortTs = last.sort_ts != null ? String(last.sort_ts) : null;
+      lastRowId = last.id;
+    }
+  } else {
+    const r = await admin
+      .from("pokemon_card_images")
+      .select("id, name, card_set, card_number")
+      .order("id", { ascending: true })
+      .range(offset, offset + batchSize - 1);
+    pErr = r.error;
+    pokemonRows = r.data;
+  }
 
   if (pErr) {
     return json({ error: pErr.message }, 500);
   }
 
   const cards = (pokemonRows ?? []) as PokemonCardCompSource[];
+  const tierByCard = new Map<string, string>();
+  if (cards.length > 0) {
+    const { data: tierRows, error: tierErr } = await admin
+      .from("pokemon_card_market_refresh")
+      .select("pokemon_card_image_id, refresh_tier")
+      .in(
+        "pokemon_card_image_id",
+        cards.map((c) => c.id),
+      );
+    if (tierErr) {
+      return json({ error: tierErr.message }, 500);
+    }
+    for (const t of tierRows ?? []) {
+      if (t.pokemon_card_image_id) {
+        tierByCard.set(t.pokemon_card_image_id, t.refresh_tier);
+      }
+    }
+  }
   let searches = 0;
   let listingsProcessed = 0;
   let inserts = 0;
   let updates = 0;
   const errors: string[] = [];
-
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  let cardsProcessed = 0;
+  let partial = false;
 
   for (const card of cards) {
+    let cardSearchCount = 0;
     for (const cardType of MARKET_COMP_FINISHES) {
       const q = ebayCompSearchQuery(card, cardType as MarketCardType);
-      if (!q) continue;
-
-      if (delayMs > 0 && searches > 0) await sleep(delayMs);
-      searches++;
-
-      let browse: Awaited<ReturnType<typeof searchBrowseBinListings>>;
-      try {
-        browse = await searchBrowseBinListings(token, q, browseLimit);
-      } catch (e) {
-        errors.push(`${card.id} ${cardType}: ${(e as Error).message}`);
-        continue;
-      }
-
-      if (browse.error) {
-        errors.push(
-          `${card.id} ${cardType}: browse ${browse.status}: ${browse.error}`,
-        );
-        continue;
-      }
-
-      const title = canonicalMarketRssTitle(card, cardType as MarketCardType);
-      if (!title) continue;
-
-      const cardName = (card.name ?? "").trim();
-      const cardNumber = (card.card_number ?? "").trim();
-      const cardSet = (card.card_set ?? "").trim();
-
-      let { data: existing, error: findErr } = await admin
-        .from("market_rss_cards")
-        .select(
-          "id, listing_url, ebay_item_id, price_cents_history, shipping_history, average_price_cents, previous_average_price_cents, shipping_average_free, shipping_average_cents, listed_date, card_name",
-        )
-        .eq("pokemon_card_image_id", card.id)
-        .eq("card_type", cardType)
-        .maybeSingle();
-
-      if (findErr) {
-        errors.push(`${card.id} ${cardType} find: ${findErr.message}`);
-        continue;
-      }
-
-      let row: DbMarketRow | null = existing as DbMarketRow | null;
-
-      for (const listing of browse.items) {
-        listingsProcessed++;
-        const nowIso = new Date().toISOString();
-        const price = listing.priceCents;
-        const ship = listing.shipping;
-
-        if (!row) {
-          const prices = appendUniquePriceRing([], price);
-          const shippingH = appendShippingRing([], ship);
-          const shipAvg = shippingAverageFromHistory(shippingH);
-
-          const { data: ins, error: insErr } = await admin
-            .from("market_rss_cards")
-            .insert({
-              rss_title: title,
-              card_name: cardName || null,
-              card_number: cardNumber || null,
-              card_set: cardSet || null,
-              pokemon_card_image_id: card.id,
-              card_type: cardType,
-              listed_date: listing.listedDate,
-              price_cents_history: prices,
-              shipping_history: shippingHistoryToJson(shippingH),
-              shipping_average_free: shipAvg.free,
-              shipping_average_cents: shipAvg.free ? null : shipAvg.cents,
-              average_price_cents: averagePriceCents(prices),
-              previous_average_price_cents: null,
-              quantity: 1,
-              ebay_item_id: listing.itemId,
-              listing_url: listing.itemWebUrl,
-              last_ingest_at: nowIso,
-            })
-            .select(
-              "id, listing_url, ebay_item_id, price_cents_history, shipping_history, average_price_cents, previous_average_price_cents, shipping_average_free, shipping_average_cents, listed_date, card_name",
-            )
-            .single();
-
-          if (insErr) {
-            errors.push(`${card.id} ${cardType} insert: ${insErr.message}`);
-            break;
-          }
-          row = ins as DbMarketRow;
-          inserts++;
-          continue;
-        }
-
-        const sameListing = isSameMarketListingUrl(
-          {
-            listing_url: row.listing_url,
-            ebay_item_id: row.ebay_item_id,
-          },
-          listing.itemWebUrl,
-          listing.itemId,
-        );
-
-        if (sameListing) {
-          const { error: upErr } = await admin.from("market_rss_cards").update({
-            updated_at: nowIso,
-            last_ingest_at: nowIso,
-            listing_url: listing.itemWebUrl,
-            ebay_item_id: listing.itemId,
-            quantity: 1,
-            listed_date: listing.listedDate ?? row.listed_date,
-          }).eq("id", row.id);
-          if (upErr) {
-            errors.push(`${row.id} same-listing: ${upErr.message}`);
-          } else {
-            updates++;
-            row = {
-              ...row,
-              listing_url: listing.itemWebUrl,
-              ebay_item_id: listing.itemId,
-              listed_date: listing.listedDate ?? row.listed_date,
-            };
-          }
-          continue;
-        }
-
-        const prevAvg = row.average_price_cents;
-        const prices = appendUniquePriceRing(
-          priceHistoryFromJson(row.price_cents_history),
-          price,
-        );
-        const shippingH = appendShippingRing(
-          shippingHistoryFromJson(row.shipping_history),
-          ship,
-        );
-        const avg = averagePriceCents(prices);
-        const shipAvg = shippingAverageFromHistory(shippingH);
-
-        const { error: upErr } = await admin.from("market_rss_cards").update({
-          updated_at: nowIso,
-          last_ingest_at: nowIso,
-          listing_url: listing.itemWebUrl,
-          ebay_item_id: listing.itemId,
-          card_name: cardName || row.card_name,
-          quantity: 1,
-          listed_date: listing.listedDate ?? row.listed_date,
-          price_cents_history: prices,
-          shipping_history: shippingHistoryToJson(shippingH),
-          shipping_average_free: shipAvg.free,
-          shipping_average_cents: shipAvg.free ? null : shipAvg.cents,
-          previous_average_price_cents: prevAvg ?? null,
-          average_price_cents: avg,
-        }).eq("id", row.id);
-
-        if (upErr) {
-          errors.push(`${row.id} update: ${upErr.message}`);
-        } else {
-          updates++;
-          row = {
-            ...row,
-            listing_url: listing.itemWebUrl,
-            ebay_item_id: listing.itemId,
-            price_cents_history: prices,
-            shipping_history: shippingHistoryToJson(shippingH),
-            average_price_cents: avg,
-            previous_average_price_cents: prevAvg ?? null,
-            shipping_average_free: shipAvg.free,
-            shipping_average_cents: shipAvg.free ? null : shipAvg.cents,
-            listed_date: listing.listedDate ?? row.listed_date,
-            card_name: cardName || row.card_name,
-          };
-        }
-      }
+      if (q) cardSearchCount++;
     }
+    if (cardSearchCount > maxSearches) {
+      return json(
+        {
+          error:
+            `MARKET_COMPS_MAX_SEARCHES (${maxSearches}) must be >= searches per card (${cardSearchCount})`,
+        },
+        400,
+      );
+    }
+    if (searches + cardSearchCount > maxSearches) {
+      partial = true;
+      break;
+    }
+
+    const tr = tierByCard.get(card.id) ?? "normal";
+    const one = await ingestOneCardMarketComps(admin, token, card, {
+      browseLimit,
+      maxListingsPerSearch,
+      delayMs,
+      recordActiveObservations: true,
+      refreshTier: tr,
+    });
+    searches += one.searches;
+    listingsProcessed += one.listingsProcessed;
+    inserts += one.inserts;
+    updates += one.updates;
+    errors.push(...one.errors);
+
+    cardsProcessed++;
   }
+
+  const nextOffset = partial
+    ? offset + cardsProcessed
+    : offset + cards.length;
+  const completedIdMode =
+    !partial &&
+    (cards.length === 0 || cards.length < batchSize);
+
+  /** Stale mode: keyset cursor; never advance offset. */
+  let completedStale = false;
+  let nextCursor: { lastAt: string; id: string } | null = null;
+  if (orderMode === "stale") {
+    if (partial) {
+      nextCursor =
+        requestCursorLastAt && requestCursorId
+          ? { lastAt: requestCursorLastAt, id: requestCursorId }
+          : null;
+    } else if (cards.length > 0 && lastSortTs && lastRowId) {
+      nextCursor = { lastAt: lastSortTs, id: lastRowId };
+    }
+    completedStale =
+      !partial &&
+      (cards.length === 0 || cards.length < batchSize);
+  }
+
+  const completed =
+    orderMode === "stale" ? completedStale : completedIdMode;
 
   return json({
     ok: true,
+    order: orderMode,
     offset,
+    nextOffset: orderMode === "id" ? nextOffset : undefined,
+    nextCursor:
+      orderMode === "stale" ? (completed ? null : nextCursor) : undefined,
+    requestCursor:
+      orderMode === "stale" && requestCursorLastAt && requestCursorId
+        ? { lastAt: requestCursorLastAt, id: requestCursorId }
+        : undefined,
+    completed,
+    partial,
+    maxSearches,
     batchSize,
+    browseLimit,
+    maxListingsPerSearch,
     pokemonCardsInBatch: cards.length,
     browseSearches: searches,
     listingsProcessed,

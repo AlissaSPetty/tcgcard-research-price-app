@@ -1,5 +1,9 @@
 import type { CompResult } from "./types.ts";
-import { ebayApiOrigin, ebayOAuthTokenUrl } from "./ebay_env.ts";
+import {
+  ebayApiOrigin,
+  ebayOAuthTokenUrl,
+  ebayUseSandbox,
+} from "./ebay_env.ts";
 import type { ShippingEntry } from "./rss_market.ts";
 
 /** Active BIN listing from Browse `item_summary` search. */
@@ -46,7 +50,13 @@ export async function ebayClientCredentialsToken(
   });
   if (!res.ok) {
     const t = await res.text();
-    throw new Error(`eBay token error: ${res.status} ${t}`);
+    const tokenUrl = ebayOAuthTokenUrl();
+    const sandbox = ebayUseSandbox();
+    const hint =
+      res.status === 401 && /invalid_client/i.test(t)
+        ? ` (token host: ${tokenUrl}; EBAY_USE_SANDBOX=${sandbox}. Production keys: api.ebay.com; omit EBAY_USE_SANDBOX or set false. Sandbox keys: set EBAY_USE_SANDBOX=true. Keys must be Client ID + secret from the same eBay app row.)`
+        : "";
+    throw new Error(`eBay token error: ${res.status} ${t}${hint}`);
   }
   const j = await res.json();
   return j.access_token as string;
@@ -82,36 +92,55 @@ function listedDateFromBrowseSummary(
   return d.toISOString().slice(0, 10);
 }
 
-/**
- * Active fixed-price (BIN) listings for a search query (US marketplace).
- */
-export async function searchBrowseBinListings(
-  token: string,
-  query: string,
-  limit = 25,
-): Promise<{ items: BrowseBinListing[]; error?: string; status?: number }> {
-  const q = encodeURIComponent(query.slice(0, 120));
-  const url =
-    `${browseBase()}/item_summary/search?q=${q}&limit=${limit}&filter=buyingOptions:{FIXED_PRICE}`;
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
-    },
-  });
-
-  if (!res.ok) {
-    const t = await res.text();
-    return {
-      items: [],
-      error: t.slice(0, 500),
-      status: res.status,
-    };
+/** eBay Browse `errors[]`: ACCESS / REQUEST throttling (e.g. errorId 2001 — "Too many requests."). */
+function browseErrorsIndicateRateLimit(json: Record<string, unknown>): boolean {
+  const errs = json.errors;
+  if (!Array.isArray(errs)) return false;
+  for (const e of errs) {
+    if (typeof e !== "object" || e === null) continue;
+    const o = e as Record<string, unknown>;
+    const id = Number(o.errorId);
+    if (id === 2001) return true;
+    const domain = String(o.domain ?? "").toUpperCase();
+    const category = String(o.category ?? "").toUpperCase();
+    if (domain === "ACCESS" && category === "REQUEST") return true;
   }
+  return false;
+}
 
-  const data = (await res.json()) as Record<string, unknown>;
+function parseRetryAfterMs(res: Response): number | null {
+  const raw = res.headers.get("Retry-After");
+  if (raw == null || raw.trim() === "") return null;
+  const sec = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  return Math.min(120_000, sec * 1000);
+}
+
+/** eBay Browse may return 429 or a JSON error such as "The request limit has been reached for the resource." */
+function browseResponseIsRateLimited(
+  status: number,
+  bodyText: string,
+  json: Record<string, unknown>,
+): boolean {
+  if (status === 429) return true;
+  if (browseErrorsIndicateRateLimit(json)) return true;
+  const blob = `${bodyText} ${JSON.stringify(json)}`.toLowerCase();
+  if (
+    blob.includes("request limit") ||
+    blob.includes("rate limit") ||
+    blob.includes("too many requests")
+  ) {
+    return true;
+  }
+  if (blob.includes("exceeded") && blob.includes("quota")) return true;
+  return false;
+}
+
+function parseBrowseItemSummaries(
+  data: Record<string, unknown>,
+): BrowseBinListing[] {
   const summaries = data.itemSummaries;
-  if (!Array.isArray(summaries)) return { items: [] };
+  if (!Array.isArray(summaries)) return [];
 
   const items: BrowseBinListing[] = [];
   for (const raw of summaries) {
@@ -131,8 +160,107 @@ export async function searchBrowseBinListings(
       listedDate: listedDateFromBrowseSummary(item),
     });
   }
+  return items;
+}
 
-  return { items };
+/** Tuned for Supabase Edge CPU/time: long retry chains cause 504 / WORKER_LIMIT. Override via MARKET_COMPS_BROWSE_MAX_RETRIES. */
+function browseRateLimitMaxAttempts(): number {
+  const g = globalThis as {
+    Deno?: { env: { get: (k: string) => string | undefined } };
+  };
+  const raw = g.Deno?.env.get("MARKET_COMPS_BROWSE_MAX_RETRIES")?.trim();
+  if (!raw) return 4;
+  const n = Number(raw);
+  return Math.min(10, Math.max(1, Number.isFinite(n) ? n : 4));
+}
+
+const BROWSE_RATE_LIMIT_BACKOFF_CAP_MS = 8_000;
+const BROWSE_RATE_LIMIT_BASE_BACKOFF_MS = 1_200;
+
+async function searchBrowseBinListingsOnce(
+  token: string,
+  query: string,
+  limit: number,
+): Promise<{
+  items: BrowseBinListing[];
+  error?: string;
+  status?: number;
+  rateLimited?: boolean;
+  /** Server hint (seconds → ms), when eBay sends Retry-After */
+  retryAfterMs?: number | null;
+}> {
+  const q = encodeURIComponent(query.slice(0, 120));
+  const url =
+    `${browseBase()}/item_summary/search?q=${q}&limit=${limit}&filter=buyingOptions:{FIXED_PRICE}`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    },
+  });
+
+  const retryAfterMs = parseRetryAfterMs(res);
+  const text = await res.text();
+  let json: Record<string, unknown> = {};
+  try {
+    json = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    /* non-JSON error body */
+  }
+
+  if (!res.ok) {
+    const rateLimited = browseResponseIsRateLimited(res.status, text, json);
+    return {
+      items: [],
+      error: text.slice(0, 500),
+      status: res.status,
+      rateLimited,
+      retryAfterMs,
+    };
+  }
+
+  const errs = json.errors;
+  if (Array.isArray(errs) && errs.length > 0) {
+    const rateLimited = browseResponseIsRateLimited(res.status, text, json);
+    return {
+      items: [],
+      error: text.slice(0, 500),
+      status: res.status,
+      rateLimited,
+      retryAfterMs,
+    };
+  }
+
+  return { items: parseBrowseItemSummaries(json) };
+}
+
+/**
+ * Active fixed-price (BIN) listings for a search query (US marketplace).
+ * Retries with backoff when eBay returns a rate limit / quota error.
+ */
+export async function searchBrowseBinListings(
+  token: string,
+  query: string,
+  limit = 25,
+): Promise<{ items: BrowseBinListing[]; error?: string; status?: number }> {
+  const maxAttempts = browseRateLimitMaxAttempts();
+  let last: Awaited<ReturnType<typeof searchBrowseBinListingsOnce>> | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      let backoff = Math.min(
+        BROWSE_RATE_LIMIT_BACKOFF_CAP_MS,
+        BROWSE_RATE_LIMIT_BASE_BACKOFF_MS * 2 ** (attempt - 1),
+      );
+      if (last?.retryAfterMs != null) {
+        backoff = Math.max(backoff, last.retryAfterMs);
+      }
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+    last = await searchBrowseBinListingsOnce(token, query, limit);
+    if (!last.error) return last;
+    if (!last.rateLimited) return last;
+  }
+  return last ?? { items: [] };
 }
 
 /**

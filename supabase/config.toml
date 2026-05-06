@@ -369,6 +369,12 @@ verify_jwt = false
 [functions.market-comps-ingest]
 verify_jwt = false
 
+[functions.market-comps-card-fetch]
+verify_jwt = false
+
+[functions.market-sold-comps-ingest]
+verify_jwt = false
+
 [functions.pokemon-card-images-ingest]
 verify_jwt = false
 

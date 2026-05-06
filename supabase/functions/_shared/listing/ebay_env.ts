@@ -1,11 +1,19 @@
 /**
- * Sandbox vs production hosts. Set EBAY_USE_SANDBOX=true when using sandbox keys
- * (App ID / Cert ID from the Sandbox section in developer.ebay.com).
+ * Production eBay hosts by default (`api.ebay.com`, `auth.ebay.com`).
+ * Sandbox when `EBAY_USE_SANDBOX=true` / `1` / `yes`, or when Client ID contains `-SBX-`
+ * (eBay Sandbox App IDs). Set `EBAY_USE_SANDBOX=false` to force production even with `-SBX-`
+ * (rare). Production keys: omit sandbox flag and use a non-Sandbox Client ID.
  */
 export function ebayUseSandbox(): boolean {
-  const v = Deno.env.get("EBAY_USE_SANDBOX") ?? Deno.env.get("EBAY_SANDBOX");
-  if (v == null || v === "") return false;
-  return v === "1" || /^true$/i.test(v) || /^yes$/i.test(v);
+  const raw = Deno.env.get("EBAY_USE_SANDBOX") ?? Deno.env.get("EBAY_SANDBOX");
+  if (raw != null && String(raw).trim() !== "") {
+    const v = String(raw).trim();
+    if (v === "0" || /^false$/i.test(v) || /^no$/i.test(v)) return false;
+    if (v === "1" || /^true$/i.test(v) || /^yes$/i.test(v)) return true;
+  }
+  const appId =
+    Deno.env.get("EBAY_APP_ID") ?? Deno.env.get("EBAY_CLIENT_ID") ?? "";
+  return appId.includes("-SBX-");
 }
 
 export function ebayApiOrigin(): string {
