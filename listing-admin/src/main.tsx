@@ -1,8 +1,10 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import App from "./App";
 import { initThemeFromStorage } from "./theme";
+import { queryClient, queryPersister } from "./queryClient";
 import "./styles.css";
 
 initThemeFromStorage();
@@ -11,9 +13,14 @@ const el = document.getElementById("root");
 if (el) {
   createRoot(el).render(
     <StrictMode>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
+      <PersistQueryClientProvider
+        client={queryClient}
+        persistOptions={{ persister: queryPersister, maxAge: 1000 * 60 * 60 * 24 }}
+      >
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </PersistQueryClientProvider>
     </StrictMode>,
   );
 }

@@ -1,8 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { ebayClientCredentialsToken } from "../_shared/listing/ebay_market.ts";
 import type { PokemonCardCompSource } from "../_shared/listing/market_comps.ts";
-import { ingestOneCardMarketComps } from "../_shared/listing/market_comps_ingest_card.ts";
+import { ingestOneCardSoldComps } from "../_shared/listing/market_sold_comps_ingest_card.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
 import { maintenanceGate } from "../_shared/maintenance.ts";
 
@@ -22,7 +21,7 @@ function json(body: unknown, status = 200) {
 async function authOk(req: Request): Promise<boolean> {
   const cron =
     Deno.env.get("LISTING_CRON_SECRET") ??
-      Deno.env.get("MARKET_COMPS_CRON_SECRET");
+      Deno.env.get("MARKET_SOLD_COMPS_CRON_SECRET");
   const secretHeader = req.headers.get("x-cron-secret");
   if (cron && secretHeader === cron) return true;
 
@@ -40,25 +39,27 @@ async function authOk(req: Request): Promise<boolean> {
   return !error && !!user;
 }
 
-function ebayAppCredentials(): { appId: string; certId: string } | null {
+/** Finding API uses App ID only (not OAuth client-credentials). */
+function ebayAppIdOnly(): string | null {
   const appId = Deno.env.get("EBAY_APP_ID") ?? Deno.env.get("EBAY_CLIENT_ID");
-  const certId =
-    Deno.env.get("EBAY_CERT_ID") ?? Deno.env.get("EBAY_CLIENT_SECRET");
-  if (!appId?.trim() || !certId?.trim()) return null;
-  return { appId: appId.trim(), certId: certId.trim() };
+  if (!appId?.trim()) return null;
+  return appId.trim();
 }
 
 function cooldownMinutes(): number {
-  const raw = Deno.env.get("MARKET_COMPS_CARD_COOLDOWN_MINUTES")?.trim();
-  const n = raw ? Number(raw) : 15;
-  return Number.isFinite(n) && n >= 0 ? Math.min(24 * 60, Math.max(0, n)) : 15;
+  const raw = Deno.env.get("MARKET_SOLD_COMPS_CARD_COOLDOWN_MINUTES")?.trim();
+  const n = raw ? Number(raw) : 60;
+  return Number.isFinite(n) && n >= 0 ? Math.min(24 * 60, Math.max(0, n)) : 60;
 }
 
-async function selectCompRows(admin: ReturnType<typeof serviceClient>, pokemonCardImageId: string) {
+async function selectSoldRows(
+  admin: ReturnType<typeof serviceClient>,
+  pokemonCardImageId: string,
+) {
   const { data, error } = await admin
-    .from("market_rss_cards")
+    .from("market_sold_comps")
     .select(
-      "id, card_type, average_price_cents, updated_at, listing_url, price_cents_history, ebay_item_id, rss_title",
+      "id, pokemon_card_image_id, card_type, average_price_cents, sample_size, updated_at",
     )
     .eq("pokemon_card_image_id", pokemonCardImageId)
     .order("card_type", { ascending: true });
@@ -104,7 +105,7 @@ Deno.serve(async (req) => {
   const admin = serviceClient();
 
   const { data: latest, error: latestErr } = await admin
-    .from("market_rss_cards")
+    .from("market_sold_comps")
     .select("updated_at")
     .eq("pokemon_card_image_id", id)
     .order("updated_at", { ascending: false })
@@ -126,7 +127,7 @@ Deno.serve(async (req) => {
     Date.now() - latestAt < cooldownMs
   ) {
     try {
-      const rows = await selectCompRows(admin, id);
+      const rows = await selectSoldRows(admin, id);
       const newestMs = rows.reduce((acc, r) => {
         const t = r.updated_at
           ? new Date(String(r.updated_at)).getTime()
@@ -146,19 +147,12 @@ Deno.serve(async (req) => {
     }
   }
 
-  const creds = ebayAppCredentials();
-  if (!creds) {
+  const appId = ebayAppIdOnly();
+  if (!appId) {
     return json(
-      { error: "Missing EBAY_APP_ID and EBAY_CERT_ID (or EBAY_CLIENT_SECRET)" },
+      { error: "Missing EBAY_APP_ID (or EBAY_CLIENT_ID) for Finding API" },
       500,
     );
-  }
-
-  let token: string;
-  try {
-    token = await ebayClientCredentialsToken(creds.appId, creds.certId);
-  } catch (e) {
-    return json({ error: (e as Error).message }, 502);
   }
 
   const { data: cardRow, error: cardErr } = await admin
@@ -185,33 +179,27 @@ Deno.serve(async (req) => {
   const refreshTier =
     (tierRow?.refresh_tier as string | undefined)?.trim() || "normal";
 
-  const rawBrowse = Number(Deno.env.get("MARKET_COMPS_BROWSE_LIMIT") ?? "10");
-  const browseLimit = Math.min(
-    50,
-    Math.max(1, Number.isFinite(rawBrowse) ? rawBrowse : 10),
+  const rawFinding = Number(
+    Deno.env.get("MARKET_SOLD_COMPS_FINDING_LIMIT") ?? "100",
   );
-  const rawMaxListings = Number(
-    Deno.env.get("MARKET_COMPS_MAX_LISTINGS_PER_SEARCH") ?? "3",
-  );
-  const maxListingsPerSearch = Math.min(
-    browseLimit,
-    Math.max(1, Number.isFinite(rawMaxListings) ? rawMaxListings : 5),
+  const findingLimit = Math.min(
+    100,
+    Math.max(1, Number.isFinite(rawFinding) ? rawFinding : 100),
   );
   const delayMs = Math.max(
     0,
-    Number(Deno.env.get("MARKET_COMPS_SEARCH_DELAY_MS") ?? "1500"),
+    Number(Deno.env.get("MARKET_SOLD_COMPS_SEARCH_DELAY_MS") ?? "0"),
   );
 
-  const result = await ingestOneCardMarketComps(admin, token, card, {
-    browseLimit,
-    maxListingsPerSearch,
+  const result = await ingestOneCardSoldComps(admin, appId, card, {
+    findingLimit,
     delayMs,
-    recordActiveObservations: true,
+    recordSnapshots: false,
     refreshTier,
   });
 
   try {
-    const rows = await selectCompRows(admin, id);
+    const rows = await selectSoldRows(admin, id);
     const newestMs = rows.reduce((acc, r) => {
       const t = r.updated_at ? new Date(String(r.updated_at)).getTime() : 0;
       return Math.max(acc, t);
@@ -224,9 +212,7 @@ Deno.serve(async (req) => {
         .toISOString(),
       rows,
       searches: result.searches,
-      listingsProcessed: result.listingsProcessed,
-      inserts: result.inserts,
-      updates: result.updates,
+      rowsUpserted: result.rowsUpserted,
       errors: result.errors,
     });
   } catch (e) {

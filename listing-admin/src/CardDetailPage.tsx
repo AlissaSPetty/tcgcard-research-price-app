@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { applyThemeToDocument, type Theme } from "./theme";
+import { tcgplayerActiveFinishes, type TcgFinish } from "./tcgFinishScope";
 
 const url = import.meta.env.VITE_SUPABASE_URL ?? "";
 const anon = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
@@ -46,8 +47,6 @@ type BinRow = {
   ebay_item_id: string | null;
   rss_title: string | null;
 };
-
-const COMP_FINISH_ORDER = ["Normal", "Holo", "Reverse Holo"] as const;
 
 function fmtCents(cents: number | null): string {
   if (cents == null) return "—";
@@ -107,10 +106,10 @@ function parseTcgFinishPrices(v: unknown): TcgFinishPrices | null {
 
 function tcgcsvPricesForFinish(
   raw: Record<string, unknown> | null | undefined,
-  finish: (typeof COMP_FINISH_ORDER)[number],
+  finish: TcgFinish,
 ): TcgFinishPrices | null {
   if (!raw) return null;
-  const tryKeys: Record<(typeof COMP_FINISH_ORDER)[number], string[]> = {
+  const tryKeys: Record<TcgFinish, string[]> = {
     Normal: ["Normal", "normal"],
     Holo: ["Holofoil", "Holo", "holofoil"],
     "Reverse Holo": ["Reverse Holofoil", "Reverse Holo", "reverse holofoil"],
@@ -140,17 +139,95 @@ function priceHistoryNums(h: unknown): number[] {
   return h.filter((x): x is number => typeof x === "number");
 }
 
-function uniqueRecentPrices(history: unknown, max = 5): number[] {
-  const nums = priceHistoryNums(history);
-  const seen = new Set<number>();
-  const out: number[] = [];
-  for (let i = nums.length - 1; i >= 0 && out.length < max; i--) {
-    const p = nums[i];
-    if (seen.has(p)) continue;
-    seen.add(p);
-    out.push(p);
+type BinObservationRow = {
+  card_type: string;
+  price_cents: number;
+  listing_url: string | null;
+  ebay_item_id: string | null;
+  observed_at: string;
+  /** Joined from `market_rss_cards` via `market_rss_card_id`. */
+  rss_title: string | null;
+};
+
+type LinkedBinSample = {
+  price_cents: number;
+  href: string;
+  title: string;
+};
+
+function listingTitleForObservation(r: BinObservationRow): string {
+  const t = r.rss_title?.trim();
+  if (t) return t;
+  const id = r.ebay_item_id?.trim();
+  if (id) return `eBay item ${id}`;
+  return "eBay listing";
+}
+
+/** Avoid scheme-less hostnames being resolved as paths on the current origin. */
+function normalizeListingUrl(raw: string): string {
+  const t = raw.trim();
+  if (!t) return t;
+  if (/^https?:\/\//i.test(t)) return t;
+  if (t.startsWith("//")) return `https:${t}`;
+  if (/^(?:www\.)?ebay\.com\b/i.test(t)) return `https://${t}`;
+  return t;
+}
+
+function ebayListingHref(row: {
+  listing_url: string | null;
+  ebay_item_id: string | null;
+}): string | null {
+  const u = row.listing_url?.trim();
+  if (u) return normalizeListingUrl(u);
+  const id = row.ebay_item_id?.trim();
+  if (id) return `https://www.ebay.com/itm/${encodeURIComponent(id)}`;
+  return null;
+}
+
+/**
+ * Observation rows are loaded newest-first. Keep only one sample per exact
+ * listing URL so one eBay item cannot show up repeatedly with stale prices.
+ */
+function linkedSamplesFromObservations(
+  rows: BinObservationRow[],
+  finish: string,
+  max = 3,
+): LinkedBinSample[] {
+  const filtered = rows.filter((r) => r.card_type === finish);
+  const seenHrefs = new Set<string>();
+  const newestDistinctFirst: LinkedBinSample[] = [];
+  for (const r of filtered) {
+    const href = ebayListingHref(r);
+    if (!href) continue;
+    if (seenHrefs.has(href)) continue;
+    seenHrefs.add(href);
+    newestDistinctFirst.push({
+      price_cents: r.price_cents,
+      href,
+      title: listingTitleForObservation(r),
+    });
+    if (newestDistinctFirst.length >= max) break;
   }
-  return out.reverse();
+  return newestDistinctFirst.slice().reverse();
+}
+
+function linkedSamplesForFinish(
+  finish: TcgFinish,
+  observations: BinObservationRow[],
+  binRow: BinRow | undefined,
+): LinkedBinSample[] {
+  const fromObs = linkedSamplesFromObservations(observations, finish, 3);
+  if (fromObs.length > 0) return fromObs;
+  const href = ebayListingHref(
+    binRow ?? { listing_url: null, ebay_item_id: null },
+  );
+  const prices = priceHistoryNums(binRow?.price_cents_history);
+  const latestPrice = prices.length > 0 ? prices[prices.length - 1] : null;
+  if (!href || latestPrice == null) return [];
+  const title =
+    binRow?.rss_title?.trim() ||
+    (binRow?.ebay_item_id ? `eBay item ${binRow.ebay_item_id}` : "eBay listing");
+  return [{ price_cents: latestPrice, href, title }];
 }
 
 type CardFetchResponse = {
@@ -159,6 +236,16 @@ type CardFetchResponse = {
   cooldownMinutes?: number;
   fetchedAt?: string | null;
   rows?: BinRow[];
+  errors?: string[];
+  error?: string;
+};
+
+type SoldFetchResponse = {
+  ok?: boolean;
+  cached?: boolean;
+  cooldownMinutes?: number;
+  fetchedAt?: string | null;
+  rows?: MarketSoldCompRow[];
   errors?: string[];
   error?: string;
 };
@@ -186,6 +273,9 @@ export default function CardDetailPage({
     Record<string, MarketSoldCompRow>
   >({});
   const [binRows, setBinRows] = useState<BinRow[]>([]);
+  const [binObservations, setBinObservations] = useState<BinObservationRow[]>(
+    [],
+  );
   const [binLoading, setBinLoading] = useState(true);
   const [binError, setBinError] = useState<string | null>(null);
   const [cachedNotice, setCachedNotice] = useState<string | null>(null);
@@ -193,6 +283,29 @@ export default function CardDetailPage({
     fetchedAt: string | null;
     cached: boolean;
   } | null>(null);
+  const [soldBusy, setSoldBusy] = useState(false);
+  const [soldManualBusy, setSoldManualBusy] = useState(false);
+  const [soldError, setSoldError] = useState<string | null>(null);
+  const [soldCachedNotice, setSoldCachedNotice] = useState<string | null>(null);
+  const [soldFetchedMeta, setSoldFetchedMeta] = useState<{
+    fetchedAt: string | null;
+    cached: boolean;
+  } | null>(null);
+  const [enlargedImageUrl, setEnlargedImageUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enlargedImageUrl) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setEnlargedImageUrl(null);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [enlargedImageUrl]);
 
   const loadCardAndSold = useCallback(async () => {
     if (!cardId) return;
@@ -225,48 +338,136 @@ export default function CardDetailPage({
     setSoldByFinish(sm);
   }, [cardId]);
 
+  const fetchBinObservations = useCallback(async () => {
+    if (!cardId) return;
+    const { data, error } = await supabase
+      .from("market_rss_active_observations")
+      .select(
+        "card_type, price_cents, listing_url, ebay_item_id, observed_at, market_rss_cards ( rss_title )",
+      )
+      .eq("pokemon_card_image_id", cardId)
+      .order("observed_at", { ascending: false })
+      .limit(250);
+    if (error) {
+      setBinObservations([]);
+      return;
+    }
+    type RawObs = {
+      card_type: string;
+      price_cents: number;
+      listing_url: string | null;
+      ebay_item_id: string | null;
+      observed_at: string;
+      market_rss_cards: { rss_title: string | null } | null;
+    };
+    const rows = ((data ?? []) as RawObs[]).map((r) => ({
+      card_type: r.card_type,
+      price_cents: r.price_cents,
+      listing_url: r.listing_url,
+      ebay_item_id: r.ebay_item_id,
+      observed_at: r.observed_at,
+      rss_title: r.market_rss_cards?.rss_title ?? null,
+    }));
+    setBinObservations(rows);
+  }, [cardId]);
+
   const fetchBinComps = useCallback(
-    async (force: boolean) => {
+    async () => {
       if (!cardId) return;
       setBinLoading(true);
       setBinError(null);
       setCachedNotice(null);
-      const { data, error } = await supabase.functions.invoke<CardFetchResponse>(
-        "market-comps-card-fetch",
-        {
-          body: { pokemon_card_image_id: cardId, force },
-        },
-      );
-      if (error) {
-        setBinError(error.message);
+      try {
+        const { data, error } = await supabase.functions.invoke<CardFetchResponse>(
+          "market-comps-card-fetch",
+          {
+            body: { pokemon_card_image_id: cardId, force: false },
+          },
+        );
+        if (error) {
+          setBinError(error.message);
+          return;
+        }
+        const payload = data as CardFetchResponse | null;
+        if (payload?.error) {
+          setBinError(payload.error);
+          return;
+        }
+        if (!payload?.ok) {
+          setBinError("Unexpected response from server");
+          return;
+        }
+        setBinRows((payload.rows ?? []) as BinRow[]);
+        setFetchedMeta({
+          fetchedAt: payload.fetchedAt ?? null,
+          cached: Boolean(payload.cached),
+        });
+        if (payload.cached) {
+          const m = payload.cooldownMinutes ?? 15;
+          setCachedNotice(`Using cached results (refresh allowed every ${m} minutes).`);
+        }
+        const errs = payload.errors?.filter(Boolean);
+        if (errs && errs.length > 0 && !(payload.rows && payload.rows.length > 0)) {
+          setBinError(errs.join("; "));
+        }
+      } finally {
         setBinLoading(false);
-        return;
+        void fetchBinObservations();
       }
-      const payload = data as CardFetchResponse | null;
-      if (payload?.error) {
-        setBinError(payload.error);
-        setBinLoading(false);
-        return;
+    },
+    [cardId, fetchBinObservations],
+  );
+
+  const fetchSoldComps = useCallback(
+    async (force: boolean) => {
+      if (!cardId) return;
+      setSoldManualBusy(force);
+      setSoldBusy(true);
+      setSoldError(null);
+      setSoldCachedNotice(null);
+      try {
+        const { data, error } = await supabase.functions.invoke<SoldFetchResponse>(
+          "market-sold-comps-card-fetch",
+          {
+            body: { pokemon_card_image_id: cardId, force },
+          },
+        );
+        if (error) {
+          setSoldError(error.message);
+          return;
+        }
+        const payload = data as SoldFetchResponse | null;
+        if (payload?.error) {
+          setSoldError(payload.error);
+          return;
+        }
+        if (!payload?.ok) {
+          setSoldError("Unexpected response from server");
+          return;
+        }
+        const sm: Record<string, MarketSoldCompRow> = {};
+        for (const r of (payload.rows ?? []) as MarketSoldCompRow[]) {
+          sm[r.card_type] = r;
+        }
+        setSoldByFinish(sm);
+        setSoldFetchedMeta({
+          fetchedAt: payload.fetchedAt ?? null,
+          cached: Boolean(payload.cached),
+        });
+        if (payload.cached) {
+          const m = payload.cooldownMinutes ?? 60;
+          setSoldCachedNotice(
+            `Using cached sold comps (refresh allowed every ${m} minutes unless you choose Refresh).`,
+          );
+        }
+        const errs = payload.errors?.filter(Boolean);
+        if (errs && errs.length > 0 && !(payload.rows && payload.rows.length > 0)) {
+          setSoldError(errs.join("; "));
+        }
+      } finally {
+        setSoldBusy(false);
+        setSoldManualBusy(false);
       }
-      if (!payload?.ok) {
-        setBinError("Unexpected response from server");
-        setBinLoading(false);
-        return;
-      }
-      setBinRows((payload.rows ?? []) as BinRow[]);
-      setFetchedMeta({
-        fetchedAt: payload.fetchedAt ?? null,
-        cached: Boolean(payload.cached),
-      });
-      if (payload.cached) {
-        const m = payload.cooldownMinutes ?? 15;
-        setCachedNotice(`Using cached results (refresh allowed every ${m} minutes unless you choose Refresh).`);
-      }
-      const errs = payload.errors?.filter(Boolean);
-      if (errs && errs.length > 0 && !(payload.rows && payload.rows.length > 0)) {
-        setBinError(errs.join("; "));
-      }
-      setBinLoading(false);
     },
     [cardId],
   );
@@ -275,10 +476,17 @@ export default function CardDetailPage({
     void loadCardAndSold();
   }, [loadCardAndSold]);
 
+  const sessionUserId = session.user.id;
+
   useEffect(() => {
-    if (!cardId || !session) return;
-    void fetchBinComps(false);
-  }, [cardId, session, fetchBinComps]);
+    if (!cardId || !sessionUserId) return;
+    void fetchBinComps();
+  }, [cardId, sessionUserId, fetchBinComps]);
+
+  useEffect(() => {
+    if (!cardId || !sessionUserId) return;
+    void fetchSoldComps(false);
+  }, [cardId, sessionUserId, fetchSoldComps]);
 
   const binByFinish = useMemo(() => {
     const m: Record<string, BinRow> = {};
@@ -288,14 +496,16 @@ export default function CardDetailPage({
     return m;
   }, [binRows]);
 
-  const maxAvgCents = useMemo(() => {
-    let m = 0;
-    for (const f of COMP_FINISH_ORDER) {
-      const v = binByFinish[f]?.average_price_cents;
-      if (v != null && v > m) m = v;
-    }
-    return m || 1;
-  }, [binByFinish]);
+  const activeFinishes = useMemo((): TcgFinish[] => {
+    if (!card) return [];
+    return tcgplayerActiveFinishes({
+      tcgplayer_prices_by_finish: card.tcgplayer_prices_by_finish,
+      tcgplayer_price_cents: card.tcgplayer_price_cents,
+    });
+  }, [card]);
+
+  const binShowSkeleton = binLoading && fetchedMeta === null;
+  const binShowOverlay = binLoading && fetchedMeta !== null;
 
   if (!url || !anon) {
     return (
@@ -344,7 +554,14 @@ export default function CardDetailPage({
           <article className="card-detail-identity">
             <div className="card-detail-media">
               {card.image_url ? (
-                <img src={card.image_url} alt={card.name} />
+                <button
+                  type="button"
+                  className="card-detail-media-button"
+                  onClick={() => setEnlargedImageUrl(card.image_url)}
+                  aria-label={`View large image: ${card.name}`}
+                >
+                  <img src={card.image_url} alt="" decoding="async" />
+                </button>
               ) : (
                 <div className="pokemon-card-media--empty">No image</div>
               )}
@@ -373,66 +590,130 @@ export default function CardDetailPage({
             </div>
           </article>
 
-          <section className="card-detail-section">
-            <h3>Market overview</h3>
-            <p className="text-muted text-sm">
-              Sold comps from eBay (Finding API) and TCGplayer subtype prices — same as the catalog grid.
-            </p>
-            <table className="market-pricing-table card-detail-market-table">
-              <thead>
-                <tr>
-                  <th scope="col">Finish</th>
-                  <th scope="col">eBay sold</th>
-                  <th scope="col">TCGplayer</th>
-                </tr>
-              </thead>
-              <tbody>
-                {COMP_FINISH_ORDER.map((finish) => {
-                  const soldRow = soldByFinish[finish];
-                  const tcgRaw = card.tcgplayer_prices_by_finish as
-                    | Record<string, unknown>
-                    | null
-                    | undefined;
-                  const tcgDetail = tcgcsvPricesForFinish(tcgRaw ?? null, finish);
-                  const tcgSummary =
-                    tcgPrimaryCents(tcgDetail) ??
-                    (finish === "Normal" ? card.tcgplayer_price_cents : null);
-                  return (
-                    <tr key={finish}>
-                      <td>{finish}</td>
-                      <td className="tabular-nums">
-                        {soldRow ? (
-                          <>
-                            {fmtCents(soldRow.average_price_cents)}
-                            <span className="text-muted text-sm">
-                              {" "}
-                              (n={soldRow.sample_size},{" "}
-                              {formatRelativeAgo(soldRow.updated_at)})
-                            </span>
-                          </>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td className="tabular-nums">{fmtCents(tcgSummary)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </section>
-
-          <section className="card-detail-section card-detail-bin">
+          <section
+            className="card-detail-section"
+            aria-busy={soldBusy || undefined}
+          >
             <div className="card-detail-bin-header">
-              <h3>Buy It Now on eBay</h3>
+              <h3>Market overview</h3>
               <button
                 type="button"
                 className="secondary"
-                disabled={binLoading}
-                onClick={() => void fetchBinComps(true)}
+                disabled={soldBusy}
+                onClick={() => void fetchSoldComps(true)}
               >
-                {binLoading ? "Refreshing…" : "Refresh listings"}
+                {soldManualBusy
+                  ? "Refreshing…"
+                  : soldBusy
+                    ? "Updating…"
+                    : "Refresh sold comps"}
               </button>
+            </div>
+            <p className="text-muted text-sm">
+              Sold comps from eBay (Finding API) and TCGplayer subtype prices — same as the catalog grid.
+            </p>
+            {soldCachedNotice && (
+              <p className="text-muted text-sm" role="status">
+                {soldCachedNotice}
+              </p>
+            )}
+            {soldError && (
+              <p className="error">
+                {soldError}{" "}
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void fetchSoldComps(false)}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+            <div className="card-detail-section-busy-wrap">
+              {soldBusy && (
+                <div
+                  className="card-detail-section-busy-overlay"
+                  aria-live="polite"
+                  role="status"
+                >
+                  <div className="card-detail-refresh-spinner" aria-hidden />
+                  <span className="card-detail-section-busy-label">
+                    {soldManualBusy ? "Refreshing sold comps…" : "Updating sold comps…"}
+                  </span>
+                </div>
+              )}
+              <table className="market-pricing-table card-detail-market-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Finish</th>
+                    <th scope="col">eBay sold</th>
+                    <th scope="col">TCGplayer</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeFinishes.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} className="text-muted text-sm">
+                        No TCGplayer prices for any finish on this card — eBay sold comps and BIN pricing are not applicable.
+                      </td>
+                    </tr>
+                  ) : (
+                    activeFinishes.map((finish) => {
+                      const soldRow = soldByFinish[finish];
+                      const tcgRaw = card.tcgplayer_prices_by_finish as
+                        | Record<string, unknown>
+                        | null
+                        | undefined;
+                      const tcgDetail = tcgcsvPricesForFinish(tcgRaw ?? null, finish);
+                      const tcgSummary =
+                        tcgPrimaryCents(tcgDetail) ??
+                        (finish === "Normal" ? card.tcgplayer_price_cents : null);
+                      return (
+                        <tr key={finish}>
+                          <td>{finish}</td>
+                          <td className="tabular-nums">
+                            {soldRow ? (
+                              <>
+                                {fmtCents(soldRow.average_price_cents)}
+                                <span className="text-muted text-sm">
+                                  {" "}
+                                  (n={soldRow.sample_size},{" "}
+                                  {formatRelativeAgo(soldRow.updated_at)})
+                                </span>
+                              </>
+                            ) : (
+                              "—"
+                            )}
+                          </td>
+                          <td className="tabular-nums">{fmtCents(tcgSummary)}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+              {soldFetchedMeta?.fetchedAt && (
+                <p className="text-muted text-sm card-detail-asof">
+                  Sold as of{" "}
+                  <time
+                    dateTime={soldFetchedMeta.fetchedAt}
+                    title={soldFetchedMeta.fetchedAt}
+                  >
+                    {formatRelativeAgo(soldFetchedMeta.fetchedAt)} (
+                    {new Date(soldFetchedMeta.fetchedAt).toLocaleString()})
+                  </time>
+                  .
+                </p>
+              )}
+            </div>
+          </section>
+
+          <section
+            className="card-detail-section card-detail-bin"
+            aria-busy={binLoading || undefined}
+          >
+            <div className="card-detail-bin-header">
+              <h3>Buy It Now on eBay</h3>
             </div>
             <p className="text-muted text-sm">
               Averages come from search-derived Buy It Now listings; they are not a guaranteed checkout price.
@@ -444,87 +725,88 @@ export default function CardDetailPage({
               </p>
             )}
 
-            <div className="card-detail-chart-wrap" aria-busy={binLoading}>
-              {binLoading && (
-                <div className="card-detail-chart-skeleton" aria-live="polite">
-                  <div className="card-detail-chart-skeleton-bars" aria-hidden>
-                    <div className="card-detail-chart-skeleton-bar" />
-                    <div className="card-detail-chart-skeleton-bar" />
-                    <div className="card-detail-chart-skeleton-bar" />
-                  </div>
-                  <p className="card-detail-chart-loading-msg">
-                    Fetching Buy It Now listings from eBay…
-                  </p>
-                </div>
+            <div className="card-detail-bin-body" aria-busy={binLoading || undefined}>
+              {binShowSkeleton && (
+                <p className="card-detail-bin-loading-msg text-muted text-sm" aria-live="polite">
+                  Fetching Buy It Now listings from eBay…
+                </p>
               )}
 
-              {!binLoading && binError && (
+              {!binShowSkeleton && binError && (
                 <p className="error">
                   {binError}{" "}
-                  <button type="button" className="secondary" onClick={() => void fetchBinComps(false)}>
+                  <button type="button" className="secondary" onClick={() => void fetchBinComps()}>
                     Retry
                   </button>
                 </p>
               )}
 
-              {!binLoading && !binError && fetchedMeta && (
-                <>
-                  <div className="card-detail-chart">
-                    {COMP_FINISH_ORDER.map((finish) => {
-                      const row = binByFinish[finish];
-                      const avg = row?.average_price_cents;
-                      const hPct = avg != null && maxAvgCents > 0
-                        ? Math.round((avg / maxAvgCents) * 100)
-                        : 0;
-                      return (
-                        <div key={finish} className="card-detail-chart-col">
-                          <div
-                            className="card-detail-chart-bar"
-                            style={{ height: `${Math.max(8, hPct)}%` }}
-                            title={avg != null ? fmtCents(avg) : "No data"}
-                          />
-                          <span className="card-detail-chart-label">{finish}</span>
-                          <span className="tabular-nums card-detail-chart-value">
-                            {fmtCents(avg)}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
+              {!binShowSkeleton && !binError && fetchedMeta && (
+                <div className="card-detail-section-busy-wrap card-detail-bin-results-wrap">
+                  {binShowOverlay && (
+                    <div
+                      className="card-detail-section-busy-overlay"
+                      aria-live="polite"
+                      role="status"
+                    >
+                      <div className="card-detail-refresh-spinner" aria-hidden />
+                      <span className="card-detail-section-busy-label">
+                        Updating Buy It Now listings…
+                      </span>
+                    </div>
+                  )}
                   <p className="text-muted text-sm card-detail-asof">
                     Results as of{" "}
                     {fetchedMeta.fetchedAt
                       ? `${formatRelativeAgo(fetchedMeta.fetchedAt)} (${new Date(fetchedMeta.fetchedAt).toLocaleString()})`
                       : "—"}
-                    . Prices and links reflect that search; listings may sell or end before you open them.
+                    .
                   </p>
-                  <ul className="card-detail-bin-links">
-                    {COMP_FINISH_ORDER.map((finish) => {
-                      const row = binByFinish[finish];
-                      if (!row?.listing_url) return null;
-                      return (
-                        <li key={finish}>
-                          <a
-                            href={row.listing_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          >
-                            View sample listing ({finish})
-                          </a>
-                          {uniqueRecentPrices(row.price_cents_history, 5).length > 0 && (
-                            <span className="text-muted text-sm">
-                              {" "}
-                              Recent prices used:{" "}
-                              {uniqueRecentPrices(row.price_cents_history, 5)
-                                .map((c) => fmtCents(c))
-                                .join(", ")}
-                            </span>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </>
+                  {activeFinishes.length === 0 ? (
+                    <p className="text-muted text-sm card-detail-bin-empty-finishes">
+                      No TCGplayer-priced finishes — Buy It Now listings are not fetched for this card.
+                    </p>
+                  ) : (
+                    <div className="card-detail-bin-sample-groups">
+                      {activeFinishes.map((finish) => {
+                        const row = binByFinish[finish];
+                        const samples = linkedSamplesForFinish(
+                          finish,
+                          binObservations,
+                          row,
+                        );
+                        return (
+                          <div key={finish} className="card-detail-bin-finish-block">
+                            <h4 className="card-detail-bin-finish-heading">{finish}</h4>
+                            {samples.length > 0 ? (
+                              <ul className="card-detail-bin-finish-prices">
+                                {samples.map((s, idx) => (
+                                  <li key={`${finish}-${s.price_cents}-${idx}`}>
+                                    <a
+                                      href={s.href}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                    >
+                                      {s.title}
+                                    </a>
+                                    <span className="tabular-nums">
+                                      {" "}
+                                      ({fmtCents(s.price_cents)})
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="text-muted text-sm card-detail-bin-finish-empty">
+                                —
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </section>
@@ -532,6 +814,35 @@ export default function CardDetailPage({
       )}
 
       {binError && !card && <p className="error">{binError}</p>}
+
+      {enlargedImageUrl && card && (
+        <div
+          className="card-image-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Large image: ${card.name}`}
+          onClick={() => setEnlargedImageUrl(null)}
+        >
+          <div
+            className="card-image-lightbox-content"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="card-image-lightbox-close secondary"
+              onClick={() => setEnlargedImageUrl(null)}
+            >
+              Close
+            </button>
+            <img
+              src={enlargedImageUrl}
+              alt={card.name}
+              className="card-image-lightbox-img"
+              decoding="async"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

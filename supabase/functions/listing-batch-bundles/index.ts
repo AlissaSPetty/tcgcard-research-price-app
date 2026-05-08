@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
 import { partitionForListing } from "../_shared/listing/bundling.ts";
+import { maintenanceGate } from "../_shared/maintenance.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -10,6 +11,9 @@ const cors = {
 };
 
 Deno.serve(async (req) => {
+  const maintenance = maintenanceGate(req, cors);
+  if (maintenance) return maintenance;
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: cors });
   }

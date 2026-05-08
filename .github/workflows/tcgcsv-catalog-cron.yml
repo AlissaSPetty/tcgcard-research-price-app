@@ -1,0 +1,65 @@
+# Full tcgcsv.com → pokemon_card_images refresh after tcgcsv’s daily publish (~20:00 UTC).
+# Stagger 20 minutes: runs at 20:20 UTC.
+#
+# Secrets:
+#   SUPABASE_POKEMON_CARD_IMAGES_INGEST_URL — https://<ref>.supabase.co/functions/v1/pokemon-card-images-ingest
+#   LISTING_CRON_SECRET — same as Edge secret
+
+name: TCGcsv catalog ingest
+
+on:
+  schedule:
+    - cron: "20 20 * * *"
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: tcgcsv-catalog-ingest
+      cancel-in-progress: false
+    steps:
+      - name: POST pokemon-card-images-ingest until completed
+        env:
+          URL: ${{ secrets.SUPABASE_POKEMON_CARD_IMAGES_INGEST_URL }}
+          SECRET: ${{ secrets.LISTING_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${URL:-}" ] || [ -z "${SECRET:-}" ]; then
+            echo "Missing SUPABASE_POKEMON_CARD_IMAGES_INGEST_URL or LISTING_CRON_SECRET repository secrets."
+            exit 1
+          fi
+          BATCH=0
+          START=0
+          while true; do
+            BATCH=$((BATCH + 1))
+            echo "=== Batch $BATCH (startGroupIndex=$START) ==="
+            TMP=$(mktemp)
+            HTTP_CODE=$(curl -sS -o "$TMP" -w "%{http_code}" -X POST "$URL" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-secret: $SECRET" \
+              -d "{\"startGroupIndex\": $START}")
+            HTTP_BODY=$(cat "$TMP")
+            rm -f "$TMP"
+            echo "$HTTP_BODY"
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "HTTP $HTTP_CODE"
+              exit 1
+            fi
+            PARTIAL=$(echo "$HTTP_BODY" | jq -r 'if .partial == true then "true" else "false" end')
+            if [ "$PARTIAL" = "true" ]; then
+              echo "$HTTP_BODY" | jq '.errors // []' || true
+              echo "(partial batch — continuing)"
+            fi
+            DONE=$(echo "$HTTP_BODY" | jq -r 'if .done == true then "true" else "false" end')
+            if [ "$DONE" = "true" ]; then
+              echo "Catalog ingest completed after $BATCH batch(es)."
+              break
+            fi
+            NEXT=$(echo "$HTTP_BODY" | jq -r 'if .nextStartGroupIndex == null or .nextStartGroupIndex == "" then empty else .nextStartGroupIndex end')
+            if [ -z "$NEXT" ] || [ "$NEXT" = "null" ]; then
+              echo "Missing nextStartGroupIndex after batch $BATCH"
+              exit 1
+            fi
+            START=$NEXT
+          done
