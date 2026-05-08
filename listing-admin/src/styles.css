@@ -387,6 +387,15 @@ section.market-dashboard table {
   max-width: none;
 }
 
+.filter-name-global-hint {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
+
+.filter-intro.filter-name-global-hint {
+  color: var(--pk-blue-900);
+}
+
 .filter-intro {
   font-size: 0.82rem;
   color: var(--neutral-500);
@@ -614,6 +623,43 @@ section.market-dashboard table {
   color: var(--neutral-700);
   line-height: 1.45;
   min-height: calc(3 * 1.45 * 0.82rem);
+}
+
+.pokemon-card-tcgplayer-delta {
+  margin: 0 0 0.45rem;
+  line-height: 1.45;
+  flex-wrap: wrap;
+}
+
+.pokemon-card-tcgplayer-delta-chip {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.pokemon-card-tcgplayer-delta-sep {
+  color: var(--neutral-400);
+  font-weight: 400;
+}
+
+.tcgplayer-delta-up {
+  color: var(--pk-green-700);
+}
+
+.tcgplayer-delta-down {
+  color: var(--pk-red-700);
+}
+
+.tcgplayer-delta-flat {
+  color: var(--neutral-600);
+}
+
+.tcgplayer-delta-na {
+  color: var(--neutral-500);
+  font-weight: 500;
+}
+
+html[data-theme="dark"] .tcgplayer-delta-flat {
+  color: var(--neutral-400);
 }
 
 .pokemon-card-comps-wrap {
@@ -867,6 +913,10 @@ html[data-theme="dark"] .pokemon-dashboard-filters {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
+html[data-theme="dark"] .filter-intro.filter-name-global-hint {
+  color: var(--pk-yellow-400);
+}
+
 html[data-theme="dark"] .pokemon-card--price-up {
   background: linear-gradient(180deg, rgba(22, 163, 74, 0.22) 0%, var(--surface) 100%);
   border-color: rgba(74, 222, 128, 0.35);
@@ -926,10 +976,6 @@ html[data-theme="dark"] td.price-down {
   text-decoration: underline;
 }
 
-.pokemon-card-open-detail-hint {
-  margin: 0.5rem 0 0;
-}
-
 .card-detail-identity {
   display: grid;
   grid-template-columns: minmax(120px, 200px) 1fr;
@@ -943,11 +989,85 @@ html[data-theme="dark"] td.price-down {
   max-width: 56rem;
 }
 
-.card-detail-media img {
+.card-detail-media-button {
+  display: block;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  cursor: zoom-in;
+  border-radius: var(--radius-md);
+  line-height: 0;
+}
+
+.card-detail-media-button:focus-visible {
+  outline: 2px solid var(--pk-blue-600);
+  outline-offset: 3px;
+}
+
+.card-detail-media-button:hover:not(:disabled) img {
+  opacity: 0.92;
+}
+
+.card-detail-media-button img {
   width: 100%;
   max-width: 200px;
   height: auto;
   border-radius: var(--radius-md);
+  display: block;
+  vertical-align: middle;
+}
+
+.card-image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem 1rem 2rem;
+  background: rgba(15, 23, 42, 0.82);
+  cursor: zoom-out;
+  animation: card-image-lightbox-in 0.15s ease-out;
+}
+
+@keyframes card-image-lightbox-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.card-image-lightbox-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.5rem;
+  max-width: min(96vw, 1120px);
+  max-height: 92vh;
+  cursor: default;
+}
+
+.card-image-lightbox-close {
+  flex-shrink: 0;
+}
+
+.card-image-lightbox-img {
+  max-width: 100%;
+  max-height: min(85vh, 900px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-image-lightbox {
+    animation: none;
+  }
 }
 
 .card-detail-section {
@@ -963,6 +1083,53 @@ html[data-theme="dark"] td.price-down {
   margin-top: 0.75rem;
 }
 
+.card-detail-section-busy-wrap {
+  position: relative;
+}
+
+.card-detail-bin-results-wrap {
+  min-height: 0;
+}
+
+.card-detail-section-busy-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  padding: 1rem;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.card-detail-section-busy-label {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--neutral-700);
+  text-align: center;
+}
+
+.card-detail-refresh-spinner {
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 2px solid var(--neutral-200);
+  border-top-color: var(--pk-blue-600);
+  border-radius: 50%;
+  animation: app-loading-spin 0.72s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-detail-refresh-spinner {
+    animation: none;
+    border-top-color: var(--pk-blue-600);
+    opacity: 0.85;
+  }
+}
+
 .card-detail-bin-header {
   display: flex;
   flex-wrap: wrap;
@@ -971,105 +1138,47 @@ html[data-theme="dark"] td.price-down {
   justify-content: space-between;
 }
 
-.card-detail-chart-wrap {
+.card-detail-bin-body {
   margin-top: 1rem;
-  min-height: 200px;
 }
 
-.card-detail-chart-skeleton {
-  padding: 1rem 0;
-}
-
-.card-detail-chart-skeleton-bars {
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  gap: 2rem;
-  height: 140px;
-  margin-bottom: 0.75rem;
-}
-
-.card-detail-chart-skeleton-bar {
-  width: 48px;
-  height: 40%;
-  border-radius: var(--radius-sm);
-  background: linear-gradient(
-    90deg,
-    var(--neutral-200) 25%,
-    var(--neutral-100) 50%,
-    var(--neutral-200) 75%
-  );
-  background-size: 200% 100%;
-  animation: card-detail-shimmer 1.2s ease-in-out infinite;
-}
-
-@keyframes card-detail-shimmer {
-  0% {
-    background-position: 200% 0;
-  }
-  100% {
-    background-position: -200% 0;
-  }
-}
-
-.card-detail-chart-loading-msg {
-  text-align: center;
-  font-weight: 600;
+.card-detail-bin-loading-msg {
   margin: 0;
-}
-
-.card-detail-chart {
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  gap: 2rem;
-  height: 160px;
-  padding: 0.5rem 0;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--neutral-50);
-}
-
-.card-detail-chart-col {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.35rem;
-  flex: 1;
-  max-width: 120px;
-}
-
-.card-detail-chart-bar {
-  width: 100%;
-  max-width: 56px;
-  min-height: 8px;
-  background: linear-gradient(180deg, var(--pk-blue-600), var(--pk-blue-800));
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  transition: height 0.25s ease;
-}
-
-.card-detail-chart-label {
-  font-size: 0.75rem;
   font-weight: 600;
-  color: var(--neutral-600);
-  text-align: center;
-}
-
-.card-detail-chart-value {
-  font-size: 0.9rem;
 }
 
 .card-detail-asof {
   margin-top: 0.75rem;
 }
 
-.card-detail-bin-links {
+.card-detail-bin-sample-groups {
   margin: 0.75rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.card-detail-bin-finish-block {
+  margin: 0;
+}
+
+.card-detail-bin-finish-heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.35rem;
+}
+
+.card-detail-bin-finish-prices {
+  margin: 0;
   padding-left: 1.25rem;
 }
 
-.card-detail-bin-links li {
-  margin-bottom: 0.35rem;
+.card-detail-bin-finish-prices li {
+  margin-bottom: 0.25rem;
+}
+
+.card-detail-bin-finish-prices a {
+  word-break: break-word;
 }
 
 @media (max-width: 640px) {

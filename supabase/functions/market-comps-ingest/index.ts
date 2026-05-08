@@ -6,9 +6,14 @@ import {
   MARKET_COMP_FINISHES,
   type PokemonCardCompSource,
 } from "../_shared/listing/market_comps.ts";
+import {
+  cardHasTcgPricingScope,
+  tcgplayerActiveFinishes,
+} from "../_shared/listing/tcg_finish_scope.ts";
 import { ingestOneCardMarketComps } from "../_shared/listing/market_comps_ingest_card.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
 import type { MarketCardType } from "../_shared/listing/rss_market.ts";
+import { maintenanceGate } from "../_shared/maintenance.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -20,6 +25,33 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+async function attachTcgPricing(
+  admin: ReturnType<typeof serviceClient>,
+  cards: PokemonCardCompSource[],
+): Promise<PokemonCardCompSource[]> {
+  if (cards.length === 0) return cards;
+  const { data, error } = await admin
+    .from("pokemon_card_images")
+    .select("id, tcgplayer_prices_by_finish, tcgplayer_price_cents")
+    .in("id", cards.map((c) => c.id));
+  if (error || !data?.length) return cards;
+  type TcgRow = {
+    id: string;
+    tcgplayer_prices_by_finish: unknown;
+    tcgplayer_price_cents: number | null;
+  };
+  const m = new Map((data as TcgRow[]).map((r) => [r.id, r]));
+  return cards.map((c) => {
+    const row = m.get(c.id);
+    if (!row) return c;
+    return {
+      ...c,
+      tcgplayer_prices_by_finish: row.tcgplayer_prices_by_finish,
+      tcgplayer_price_cents: row.tcgplayer_price_cents,
+    };
   });
 }
 
@@ -53,6 +85,9 @@ function ebayAppCredentials(): { appId: string; certId: string } | null {
 }
 
 Deno.serve(async (req) => {
+  const maintenance = maintenanceGate(req, cors);
+  if (maintenance) return maintenance;
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: cors });
   }
@@ -196,14 +231,15 @@ Deno.serve(async (req) => {
   }
 
   const cards = (pokemonRows ?? []) as PokemonCardCompSource[];
+  const cardsWithTcg = await attachTcgPricing(admin, cards);
   const tierByCard = new Map<string, string>();
-  if (cards.length > 0) {
+  if (cardsWithTcg.length > 0) {
     const { data: tierRows, error: tierErr } = await admin
       .from("pokemon_card_market_refresh")
       .select("pokemon_card_image_id, refresh_tier")
       .in(
         "pokemon_card_image_id",
-        cards.map((c) => c.id),
+        cardsWithTcg.map((c) => c.id),
       );
     if (tierErr) {
       return json({ error: tierErr.message }, 500);
@@ -222,9 +258,12 @@ Deno.serve(async (req) => {
   let cardsProcessed = 0;
   let partial = false;
 
-  for (const card of cards) {
+  for (const card of cardsWithTcg) {
+    const activeFinishes = cardHasTcgPricingScope(card)
+      ? tcgplayerActiveFinishes(card)
+      : [...MARKET_COMP_FINISHES];
     let cardSearchCount = 0;
-    for (const cardType of MARKET_COMP_FINISHES) {
+    for (const cardType of activeFinishes) {
       const q = ebayCompSearchQuery(card, cardType as MarketCardType);
       if (q) cardSearchCount++;
     }
@@ -261,10 +300,10 @@ Deno.serve(async (req) => {
 
   const nextOffset = partial
     ? offset + cardsProcessed
-    : offset + cards.length;
+    : offset + cardsWithTcg.length;
   const completedIdMode =
     !partial &&
-    (cards.length === 0 || cards.length < batchSize);
+    (cardsWithTcg.length === 0 || cardsWithTcg.length < batchSize);
 
   /** Stale mode: keyset cursor; never advance offset. */
   let completedStale = false;
@@ -275,12 +314,12 @@ Deno.serve(async (req) => {
         requestCursorLastAt && requestCursorId
           ? { lastAt: requestCursorLastAt, id: requestCursorId }
           : null;
-    } else if (cards.length > 0 && lastSortTs && lastRowId) {
+    } else if (cardsWithTcg.length > 0 && lastSortTs && lastRowId) {
       nextCursor = { lastAt: lastSortTs, id: lastRowId };
     }
     completedStale =
       !partial &&
-      (cards.length === 0 || cards.length < batchSize);
+      (cardsWithTcg.length === 0 || cardsWithTcg.length < batchSize);
   }
 
   const completed =
@@ -303,7 +342,7 @@ Deno.serve(async (req) => {
     batchSize,
     browseLimit,
     maxListingsPerSearch,
-    pokemonCardsInBatch: cards.length,
+    pokemonCardsInBatch: cardsWithTcg.length,
     browseSearches: searches,
     listingsProcessed,
     inserts,

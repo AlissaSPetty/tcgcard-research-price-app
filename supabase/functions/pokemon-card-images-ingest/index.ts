@@ -14,6 +14,7 @@ import {
   syncPokemonSeriesDisplayFromTcgdex,
 } from "../_shared/listing/tcgdex_series.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
+import { maintenanceGate } from "../_shared/maintenance.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -88,6 +89,9 @@ async function fetchJson(url: string): Promise<TcgcsvListPayload> {
 }
 
 Deno.serve(async (req) => {
+  const maintenance = maintenanceGate(req, cors);
+  if (maintenance) return maintenance;
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: cors });
   }
@@ -99,7 +103,12 @@ Deno.serve(async (req) => {
     return json({ error: "Unauthorized" }, 401);
   }
 
-  let body: { startGroupIndex?: number; groupsPerRun?: number } = {};
+  let body: {
+    startGroupIndex?: number;
+    groupsPerRun?: number;
+    emergencyBatch?: boolean;
+    fullNightlyRerun?: boolean;
+  } = {};
   try {
     const t = await req.text();
     if (t) body = JSON.parse(t) as typeof body;
@@ -111,17 +120,21 @@ Deno.serve(async (req) => {
     Deno.env.get("TCGCSV_CATEGORY_BASE")?.trim() || DEFAULT_TCGCSV_BASE
   ).replace(/\/$/, "");
 
+  /** One group per invocation by default so a bad set does not block the rest; raise via env to batch. */
   const groupsPerRun = Math.min(
     500,
     Math.max(
       1,
-      Number(Deno.env.get("POKEMON_CARD_IMAGES_GROUPS_PER_RUN") ?? "4"),
+      Number(Deno.env.get("POKEMON_CARD_IMAGES_GROUPS_PER_RUN") ?? "1"),
     ),
   );
   const startGroupIndex = Math.max(
     0,
     Math.floor(Number(body.startGroupIndex ?? 0)),
   );
+  const emergencyBatch = body.emergencyBatch === true;
+  const fullNightlyRerun = body.fullNightlyRerun === true;
+  const runIsGenerationBumpEligible = !emergencyBatch || fullNightlyRerun;
   const runCount = Math.min(
     500,
     Math.max(1, Number(body.groupsPerRun ?? groupsPerRun)),
@@ -133,6 +146,20 @@ Deno.serve(async (req) => {
   );
 
   const admin = serviceClient();
+  if (startGroupIndex === 0) {
+    const { error: ingestStartErr } = await admin.rpc("set_listing_catalog_ingest_running", {
+      p_running: true,
+    });
+    if (ingestStartErr) {
+      return json(
+        {
+          ok: false,
+          errors: [`set_listing_catalog_ingest_running(true): ${ingestStartErr.message}`],
+        },
+        500,
+      );
+    }
+  }
   const errors: string[] = [];
   let rowsUpserted = 0;
 
@@ -288,6 +315,7 @@ Deno.serve(async (req) => {
       }));
 
     const imageIdByProductId = new Map<number, string>();
+    let groupUpsertFailed = false;
     for (let i = 0; i < rows.length; i += UPSERT_CHUNK) {
       const chunk = rows.slice(i, i + UPSERT_CHUNK);
       const { data: upRows, error: upErr } = await admin
@@ -299,19 +327,8 @@ Deno.serve(async (req) => {
         .select("id, tcgplayer_product_id");
       if (upErr) {
         errors.push(`group_${group.groupId}_upsert: ${upErr.message}`);
-        return json(
-          {
-            ok: false,
-            sourceBase: base,
-            totalGroups,
-            startGroupIndex,
-            endGroupIndex: endIdxExclusive - 1,
-            groupsProcessed: gi - startGroupIndex,
-            rowsUpserted,
-            errors,
-          },
-          500,
-        );
+        groupUpsertFailed = true;
+        break;
       }
       for (const row of (upRows ?? []) as Array<{ id: string; tcgplayer_product_id: number }>) {
         if (typeof row.tcgplayer_product_id === "number" && row.id) {
@@ -322,7 +339,7 @@ Deno.serve(async (req) => {
     }
 
     // Persist append-only TCGPlayer/tcgcsv price history for charting.
-    if (rows.length > 0) {
+    if (!groupUpsertFailed && rows.length > 0) {
       const nowIso = new Date().toISOString();
       const snapshots: TcgplayerSnapshotInsert[] = [];
       for (const r of rows) {
@@ -374,11 +391,34 @@ Deno.serve(async (req) => {
   const endGroupIndex = endIdxExclusive - 1;
   const nextStart = endIdxExclusive < totalGroups ? endIdxExclusive : null;
   const done = nextStart === null;
+  const partial = errors.length > 0;
 
-  if (errors.length > 0) {
-    return json(
-      {
-        ok: false,
+  if (done) {
+    if (runIsGenerationBumpEligible) {
+      const { data: generation, error: finalizeErr } = await admin.rpc(
+        "finalize_listing_catalog_generation_bump",
+      );
+      if (finalizeErr) {
+        return json(
+          {
+            ok: false,
+            partial,
+            sourceBase: base,
+            totalGroups,
+            startGroupIndex,
+            endGroupIndex,
+            groupsProcessed: endIdxExclusive - startGroupIndex,
+            rowsUpserted,
+            nextStartGroupIndex: nextStart,
+            done,
+            errors: [...errors, `finalize_listing_catalog_generation_bump: ${finalizeErr.message}`],
+          },
+          500,
+        );
+      }
+      return json({
+        ok: !partial,
+        partial,
         sourceBase: base,
         totalGroups,
         startGroupIndex,
@@ -387,14 +427,39 @@ Deno.serve(async (req) => {
         rowsUpserted,
         nextStartGroupIndex: nextStart,
         done,
+        generation,
+        ingestRunning: false,
         errors,
-      },
-      500,
-    );
+      });
+    }
+
+    const { error: ingestStopErr } = await admin.rpc("set_listing_catalog_ingest_running", {
+      p_running: false,
+    });
+    if (ingestStopErr) {
+      return json(
+        {
+          ok: false,
+          partial,
+          sourceBase: base,
+          totalGroups,
+          startGroupIndex,
+          endGroupIndex,
+          groupsProcessed: endIdxExclusive - startGroupIndex,
+          rowsUpserted,
+          nextStartGroupIndex: nextStart,
+          done,
+          errors: [...errors, `set_listing_catalog_ingest_running(false): ${ingestStopErr.message}`],
+        },
+        500,
+      );
+    }
   }
 
+  // HTTP 200 so callers advance nextStartGroupIndex even when some groups failed.
   return json({
-    ok: true,
+    ok: !partial,
+    partial,
     sourceBase: base,
     totalGroups,
     startGroupIndex,
@@ -403,6 +468,8 @@ Deno.serve(async (req) => {
     rowsUpserted,
     nextStartGroupIndex: nextStart,
     done,
-    errors: [],
+    ingestRunning: done ? false : true,
+    generationBumpEligible: runIsGenerationBumpEligible,
+    errors,
   });
 });

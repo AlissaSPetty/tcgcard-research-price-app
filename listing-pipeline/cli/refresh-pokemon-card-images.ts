@@ -18,6 +18,7 @@ loadEnvFromProjectRoot();
 
 type IngestResponse = {
   ok?: boolean;
+  partial?: boolean;
   done?: boolean;
   nextStartGroupIndex?: number | null;
   rowsUpserted?: number;
@@ -81,8 +82,11 @@ async function main() {
     }
 
     console.log(text);
-    if (!res.ok || parsed.ok === false) {
+    if (!res.ok) {
       process.exit(1);
+    }
+    if (parsed.partial && parsed.errors?.length) {
+      console.warn("Partial batch (continuing):", parsed.errors.join("; "));
     }
 
     totalRows += parsed.rowsUpserted ?? 0;

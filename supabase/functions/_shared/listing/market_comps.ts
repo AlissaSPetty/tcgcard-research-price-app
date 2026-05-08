@@ -12,6 +12,10 @@ export interface PokemonCardCompSource {
   name: string | null;
   card_set: string | null;
   card_number: string | null;
+  /** tcgcsv `/prices` keyed by subTypeName — drives which finishes exist for comps. */
+  tcgplayer_prices_by_finish?: unknown;
+  /** Legacy aggregate; counts as Normal when subtype Normal is absent. */
+  tcgplayer_price_cents?: number | null;
 }
 
 /**

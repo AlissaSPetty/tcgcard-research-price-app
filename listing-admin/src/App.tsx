@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Routes, Route } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { applyThemeToDocument, type Theme } from "./theme";
-import PokemonDashboard from "./PokemonDashboard";
-import CardDetailPage from "./CardDetailPage";
+
+const PokemonDashboard = lazy(() => import("./PokemonDashboard"));
+const CardDetailPage = lazy(() => import("./CardDetailPage"));
 
 const url = import.meta.env.VITE_SUPABASE_URL ?? "";
 const anon = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
@@ -111,29 +112,31 @@ export default function App() {
   }
 
   return (
-    <Routes>
-      <Route
-        path="/card/:cardId"
-        element={
-          <CardDetailPage
-            session={session}
-            theme={theme}
-            setTheme={setTheme}
-            onSignOut={signOut}
-          />
-        }
-      />
-      <Route
-        path="*"
-        element={
-          <PokemonDashboard
-            session={session}
-            theme={theme}
-            setTheme={setTheme}
-            onSignOut={signOut}
-          />
-        }
-      />
-    </Routes>
+    <Suspense fallback={<p className="text-muted text-sm">Loading page…</p>}>
+      <Routes>
+        <Route
+          path="/card/:cardId"
+          element={
+            <CardDetailPage
+              session={session}
+              theme={theme}
+              setTheme={setTheme}
+              onSignOut={signOut}
+            />
+          }
+        />
+        <Route
+          path="*"
+          element={
+            <PokemonDashboard
+              session={session}
+              theme={theme}
+              setTheme={setTheme}
+              onSignOut={signOut}
+            />
+          }
+        />
+      </Routes>
+    </Suspense>
   );
 }

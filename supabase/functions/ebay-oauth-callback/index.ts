@@ -1,18 +1,23 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
 import { ebayOAuthTokenUrl } from "../_shared/listing/ebay_env.ts";
+import { maintenanceModeEnabled } from "../_shared/maintenance.ts";
 
 Deno.serve(async (req) => {
+  const html = (body: string, status = 200) =>
+    new Response(
+      `<!DOCTYPE html><html><head><meta charset="utf-8"><title>eBay</title></head><body><p>${body}</p><p><a href="/">Back to app</a></p></body></html>`,
+      { status, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+
+  if (maintenanceModeEnabled()) {
+    return html("Service temporarily unavailable (maintenance).", 503);
+  }
+
   const u = new URL(req.url);
   const code = u.searchParams.get("code");
   const state = u.searchParams.get("state");
   const err = u.searchParams.get("error");
-
-  const html = (body: string) =>
-    new Response(
-      `<!DOCTYPE html><html><head><meta charset="utf-8"><title>eBay</title></head><body><p>${body}</p><p><a href="/">Back to app</a></p></body></html>`,
-      { headers: { "Content-Type": "text/html; charset=utf-8" } },
-    );
 
   if (err) {
     return html(`eBay OAuth error: ${err}`);

@@ -6,9 +6,14 @@ import { searchBrowseBinListings } from "./ebay_market.ts";
 import {
   canonicalMarketRssTitle,
   ebayCompSearchQuery,
-  MARKET_COMP_FINISHES,
   type PokemonCardCompSource,
 } from "./market_comps.ts";
+import {
+  cardHasTcgPricingScope,
+  marketCompFinishesExcludedByTcg,
+  marketCompFinishesFallback,
+  tcgplayerActiveFinishes,
+} from "./tcg_finish_scope.ts";
 import { nextActiveRefreshAtIso } from "./market_refresh.ts";
 import {
   appendShippingRing,
@@ -89,6 +94,29 @@ export async function ingestOneCardMarketComps(
   let updates = 0;
   const errors: string[] = [];
 
+  const activeFinishes = cardHasTcgPricingScope(card)
+    ? tcgplayerActiveFinishes(card)
+    : marketCompFinishesFallback();
+  const excludedBin = cardHasTcgPricingScope(card)
+    ? marketCompFinishesExcludedByTcg(activeFinishes)
+    : [];
+  if (excludedBin.length > 0) {
+    const { error: delM } = await admin
+      .from("market_rss_cards")
+      .delete()
+      .eq("pokemon_card_image_id", card.id)
+      .in("card_type", excludedBin);
+    if (delM) errors.push(`cleanup market_rss_cards: ${delM.message}`);
+    const { error: delO } = await admin
+      .from("market_rss_active_observations")
+      .delete()
+      .eq("pokemon_card_image_id", card.id)
+      .in("card_type", excludedBin);
+    if (delO) {
+      errors.push(`cleanup market_rss_active_observations: ${delO.message}`);
+    }
+  }
+
   const activeObsBatch: {
     pokemon_card_image_id: string;
     market_rss_card_id: string;
@@ -101,7 +129,7 @@ export async function ingestOneCardMarketComps(
   }[] = [];
 
   let cardSearchCount = 0;
-  for (const cardType of MARKET_COMP_FINISHES) {
+  for (const cardType of activeFinishes) {
     const q = ebayCompSearchQuery(card, cardType as MarketCardType);
     if (q) cardSearchCount++;
   }
@@ -125,7 +153,7 @@ export async function ingestOneCardMarketComps(
     return { searches, listingsProcessed, inserts, updates, errors };
   }
 
-  for (const cardType of MARKET_COMP_FINISHES) {
+  for (const cardType of activeFinishes) {
     const q = ebayCompSearchQuery(card, cardType as MarketCardType);
     if (!q) continue;
 
