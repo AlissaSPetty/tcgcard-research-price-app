@@ -251,6 +251,8 @@ type SoldFetchResponse = {
     sample_size: number;
     raw?: Record<string, unknown>;
   }>;
+  /** True when amounts came from Browse BIN because Finding was unavailable / rate-limited. */
+  soldBrowseFallbackUsed?: boolean;
 };
 
 export type CardDetailPageProps = {
@@ -294,7 +296,13 @@ export default function CardDetailPage({
     fetchedAt: string | null;
     cached: boolean;
   } | null>(null);
+  const [soldBrowseFallbackNotice, setSoldBrowseFallbackNotice] =
+    useState(false);
   const [enlargedImageUrl, setEnlargedImageUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSoldBrowseFallbackNotice(false);
+  }, [cardId]);
 
   useEffect(() => {
     if (!enlargedImageUrl) return;
@@ -428,6 +436,7 @@ export default function CardDetailPage({
       setSoldBusy(true);
       setSoldError(null);
       setSoldCachedNotice(null);
+      setSoldBrowseFallbackNotice(false);
       try {
         const { data, error } = await supabase.functions.invoke<SoldFetchResponse>(
           "market-sold-comps-card-fetch",
@@ -457,35 +466,9 @@ export default function CardDetailPage({
           fetchedAt: payload.fetchedAt ?? null,
           cached: Boolean(payload.cached),
         });
-        // #region agent log
-        fetch("http://127.0.0.1:7778/ingest/88db9006-aa01-456d-84ff-fc395f94e133", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Debug-Session-Id": "deb939",
-          },
-          body: JSON.stringify({
-            sessionId: "deb939",
-            hypothesisId: "H1-H5",
-            location: "CardDetailPage.tsx:fetchSoldComps",
-            message: "market-sold-comps-card-fetch response",
-            data: {
-              force,
-              cached: Boolean(payload.cached),
-              rowSummaries: (payload.rows ?? []).map((r) => ({
-                card_type: r.card_type,
-                n: r.sample_size,
-                cents: r.average_price_cents,
-              })),
-              findingDiagnostics: payload.findingDiagnostics,
-              errors: payload.errors,
-              searches: payload.searches,
-            },
-            timestamp: Date.now(),
-            runId: "post-fix",
-          }),
-        }).catch(() => {});
-        // #endregion
+        if (!payload.cached && payload.soldBrowseFallbackUsed != null) {
+          setSoldBrowseFallbackNotice(Boolean(payload.soldBrowseFallbackUsed));
+        }
         if (payload.cached) {
           const m = payload.cooldownMinutes ?? 60;
           setSoldCachedNotice(
@@ -644,6 +627,13 @@ export default function CardDetailPage({
             <p className="text-muted text-sm">
               Sold comps from eBay (Finding API) and TCGplayer subtype prices — same as the catalog grid.
             </p>
+            {soldBrowseFallbackNotice && (
+              <p className="text-muted text-sm" role="status">
+                eBay sold (Finding) was rate-limited or unavailable; the amounts below
+                are from <strong>active Buy It Now</strong> listings as an estimate, not
+                completed sales.
+              </p>
+            )}
             {soldCachedNotice && (
               <p className="text-muted text-sm" role="status">
                 {soldCachedNotice}
