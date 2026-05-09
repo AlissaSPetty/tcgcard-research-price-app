@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { ebayClientCredentialsToken } from "../_shared/listing/ebay_market.ts";
 import type { PokemonCardCompSource } from "../_shared/listing/market_comps.ts";
 import { ingestOneCardSoldComps } from "../_shared/listing/market_sold_comps_ingest_card.ts";
 import { serviceClient } from "../_shared/listing/supabase_admin.ts";
@@ -44,6 +45,15 @@ function ebayAppIdOnly(): string | null {
   const appId = Deno.env.get("EBAY_APP_ID") ?? Deno.env.get("EBAY_CLIENT_ID");
   if (!appId?.trim()) return null;
   return appId.trim();
+}
+
+/** Browse API fallback (same keys as `market-comps-card-fetch`). */
+function ebayAppCredentials(): { appId: string; certId: string } | null {
+  const appId = Deno.env.get("EBAY_APP_ID") ?? Deno.env.get("EBAY_CLIENT_ID");
+  const certId =
+    Deno.env.get("EBAY_CERT_ID") ?? Deno.env.get("EBAY_CLIENT_SECRET");
+  if (!appId?.trim() || !certId?.trim()) return null;
+  return { appId: appId.trim(), certId: certId.trim() };
 }
 
 function cooldownMinutes(): number {
@@ -191,11 +201,25 @@ Deno.serve(async (req) => {
     Number(Deno.env.get("MARKET_SOLD_COMPS_SEARCH_DELAY_MS") ?? "0"),
   );
 
+  let browseFallbackToken: string | undefined;
+  const creds = ebayAppCredentials();
+  if (creds) {
+    try {
+      browseFallbackToken = await ebayClientCredentialsToken(
+        creds.appId,
+        creds.certId,
+      );
+    } catch {
+      browseFallbackToken = undefined;
+    }
+  }
+
   const result = await ingestOneCardSoldComps(admin, appId, card, {
     findingLimit,
     delayMs,
     recordSnapshots: false,
     refreshTier,
+    browseFallbackToken,
   });
 
   try {
@@ -204,6 +228,9 @@ Deno.serve(async (req) => {
       const t = r.updated_at ? new Date(String(r.updated_at)).getTime() : 0;
       return Math.max(acc, t);
     }, 0);
+    const soldBrowseFallbackUsed = (result.findingDiagnostics ?? []).some(
+      (d) => d.raw?.source === "browse_bin_fallback",
+    );
     return json({
       ok: true,
       cached: false,
@@ -214,6 +241,8 @@ Deno.serve(async (req) => {
       searches: result.searches,
       rowsUpserted: result.rowsUpserted,
       errors: result.errors,
+      findingDiagnostics: result.findingDiagnostics ?? [],
+      soldBrowseFallbackUsed,
     });
   } catch (e) {
     return json({ error: (e as Error).message }, 500);

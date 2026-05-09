@@ -331,6 +331,19 @@ export function mockComps(fixedCents: number): CompResult {
   };
 }
 
+/** eBay Finding HTTP 500 JSON often includes Security / RateLimiter / errorId 10001. */
+function findingResponseLooksRateLimited(status: number, bodyText: string): boolean {
+  if (status === 429) return true;
+  if (status !== 500) return false;
+  const t = bodyText.toLowerCase();
+  return (
+    t.includes("ratelimiter") ||
+    t.includes("rate limit") ||
+    t.includes("10001") ||
+    t.includes("too many request")
+  );
+}
+
 export async function fetchSoldCompsAverageCents(
   appId: string | null,
   query: string,
@@ -340,18 +353,25 @@ export async function fetchSoldCompsAverageCents(
     return {
       averageCents: null,
       sampleSize: 0,
-      raw: { reason: "no_ebay_app_id" },
+      raw: {
+        reason: "no_ebay_app_id",
+        ingestSoldRow: false,
+        diag_sandboxHost: false,
+        diag_keywordsTruncated: query.length > 120,
+        diag_queryFullLen: query.length,
+      },
     };
   }
 
   const id = appId.trim();
+  const keywordsSent = query.slice(0, 120);
   const params = new URLSearchParams({
     "OPERATION-NAME": "findCompletedItems",
     "SERVICE-VERSION": "1.13.0",
     "SECURITY-APPNAME": id,
     "RESPONSE-DATA-FORMAT": "JSON",
     "REST-PAYLOAD": "true",
-    keywords: query.slice(0, 120),
+    keywords: keywordsSent,
     "paginationInput.entriesPerPage": String(Math.min(Math.max(limit, 1), 100)),
     "itemFilter(0).name": "SoldItemsOnly",
     "itemFilter(0).value": "true",
@@ -360,43 +380,146 @@ export async function fetchSoldCompsAverageCents(
     sortOrder: "EndTimeSoonest",
   });
   const findingUrl = `${findingBase(id)}?${params.toString()}`;
-  const findingRes = await fetch(findingUrl);
 
-  let findingReason: string | null = null;
+  const MAX_FINDING_ATTEMPTS = 4;
+  const BASE_BACKOFF_MS = 1200;
+  let findingRes!: Response;
+  let lastErrTxt = "";
 
-  if (findingRes.ok) {
-    const body = await findingRes.json() as Record<string, unknown>;
-    const ack = body?.findCompletedItemsResponse?.[0]?.ack?.[0];
-    if (ack && ack !== "Success" && ack !== "Warning") {
-      findingReason = `finding_api_ack_error:${ack}`;
+  for (let attempt = 1; attempt <= MAX_FINDING_ATTEMPTS; attempt++) {
+    findingRes = await fetch(findingUrl);
+    if (findingRes.ok) break;
+    lastErrTxt = await findingRes.text();
+    if (
+      attempt < MAX_FINDING_ATTEMPTS &&
+      findingResponseLooksRateLimited(findingRes.status, lastErrTxt)
+    ) {
+      const waitMs =
+        parseRetryAfterMs(findingRes) ??
+        Math.min(12_000, BASE_BACKOFF_MS * 2 ** (attempt - 1));
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
     }
-    const items = normalizeFindingItems(body);
-    const cents: number[] = [];
-    for (const raw of items) {
-      const item = raw as Record<string, unknown>;
-      const rawPrice = item?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__;
-      const n = Number.parseFloat(String(rawPrice ?? ""));
-      if (Number.isNaN(n) || n <= 0 || n > 10000) continue;
-      cents.push(Math.round(n * 100));
-    }
-    if (cents.length) {
-      const average = Math.round(cents.reduce((sum, p) => sum + p, 0) / cents.length);
-      return {
-        averageCents: average,
-        sampleSize: cents.length,
-        raw: { source: "finding_api", parsedCount: cents.length },
-      };
-    }
-    if (!findingReason) findingReason = "finding_api_no_items";
-  } else {
-    const errTxt = await findingRes.text();
-    findingReason = `finding_api_http_error:${findingRes.status}:${errTxt.slice(0, 120)}`;
+    break;
   }
 
+  let findingReason: string | null = null;
+  let ackDiag: string | null = null;
+  let normalizedItemCount = 0;
+  let parseHint: string | undefined;
+
+  const diagCommon = () => ({
+    diag_sandboxHost: id.includes("-SBX-"),
+    diag_keywordsLen: keywordsSent.length,
+    diag_queryFullLen: query.length,
+    diag_keywordsTruncated: query.length > 120,
+  });
+
+  if (!findingRes.ok) {
+    const snippet = lastErrTxt ||
+      (await findingRes.text().catch(() => ""));
+    findingReason =
+      `finding_api_http_error:${findingRes.status}:${snippet.slice(0, 200)}`;
+    return {
+      averageCents: null,
+      sampleSize: 0,
+      raw: {
+        reason: findingReason,
+        ingestSoldRow: false,
+        diag_ack: null,
+        diag_normalizedItemCount: 0,
+        diag_centsParsedCount: 0,
+        diag_parseHint: parseHint,
+        diag_httpOk: false,
+        diag_httpStatus: findingRes.status,
+        ...diagCommon(),
+      },
+    };
+  }
+
+  const body = await findingRes.json() as Record<string, unknown>;
+  const ack = body?.findCompletedItemsResponse?.[0]?.ack?.[0];
+  ackDiag = ack != null ? String(ack) : null;
+  if (ack && ack !== "Success" && ack !== "Warning") {
+    return {
+      averageCents: null,
+      sampleSize: 0,
+      raw: {
+        reason: `finding_api_ack_error:${ack}`,
+        ingestSoldRow: false,
+        diag_ack: ackDiag,
+        diag_normalizedItemCount: 0,
+        diag_centsParsedCount: 0,
+        ...diagCommon(),
+      },
+    };
+  }
+
+  const items = normalizeFindingItems(body);
+  normalizedItemCount = items.length;
+  const cents: number[] = [];
+  for (const raw of items) {
+    const item = raw as Record<string, unknown>;
+    const rawPrice = item?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__;
+    const n = Number.parseFloat(String(rawPrice ?? ""));
+    if (Number.isNaN(n) || n <= 0 || n > 10000) continue;
+    cents.push(Math.round(n * 100));
+  }
+  if (items.length > 0 && cents.length === 0) {
+    const item0 = items[0] as Record<string, unknown>;
+    parseHint = item0?.sellingStatus != null
+      ? "items_but_price_parse_failed"
+      : "items_missing_sellingStatus_shape";
+    return {
+      averageCents: null,
+      sampleSize: 0,
+      raw: {
+        reason: "finding_api_price_parse_failed",
+        ingestSoldRow: false,
+        diag_ack: ackDiag,
+        diag_normalizedItemCount: normalizedItemCount,
+        diag_centsParsedCount: 0,
+        diag_parseHint: parseHint,
+        diag_httpOk: true,
+        diag_httpStatus: findingRes.status,
+        ...diagCommon(),
+      },
+    };
+  }
+  if (cents.length) {
+    const average = Math.round(cents.reduce((sum, p) => sum + p, 0) / cents.length);
+    return {
+      averageCents: average,
+      sampleSize: cents.length,
+      raw: {
+        source: "finding_api",
+        ingestSoldRow: true,
+        parsedCount: cents.length,
+        diag_ack: ackDiag,
+        diag_normalizedItemCount: normalizedItemCount,
+        diag_centsParsedCount: cents.length,
+        diag_httpOk: true,
+        diag_httpStatus: findingRes.status,
+        ...diagCommon(),
+      },
+    };
+  }
+
+  findingReason = "finding_api_no_items";
   return {
     averageCents: null,
     sampleSize: 0,
-    raw: { reason: findingReason ?? "finding_api_failed" },
+    raw: {
+      reason: findingReason,
+      ingestSoldRow: true,
+      diag_ack: ackDiag,
+      diag_normalizedItemCount: normalizedItemCount,
+      diag_centsParsedCount: 0,
+      diag_parseHint: parseHint,
+      diag_httpOk: true,
+      diag_httpStatus: findingRes.status,
+      ...diagCommon(),
+    },
   };
 }
 

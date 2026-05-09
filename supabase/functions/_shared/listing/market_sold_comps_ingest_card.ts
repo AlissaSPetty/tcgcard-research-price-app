@@ -2,7 +2,10 @@
  * Per-card eBay Finding (sold) → market_sold_comps ingest (shared by batch
  * `market-sold-comps-ingest` and on-demand `market-sold-comps-card-fetch`).
  */
-import { fetchSoldCompsAverageCents } from "./ebay_market.ts";
+import {
+  fetchMarketCompsBrowse,
+  fetchSoldCompsAverageCents,
+} from "./ebay_market.ts";
 import {
   canonicalMarketRssTitle,
   ebayCompSearchQuery,
@@ -28,15 +31,47 @@ export type IngestOneCardSoldOptions = {
   recordSnapshots: boolean;
   /** From `pokemon_card_market_refresh.refresh_tier` for this card. */
   refreshTier: string;
+  /**
+   * Browse OAuth token (same app + cert as BIN comps). When Finding fails with a
+   * transport/rate-limit style error, use active BIN listings as a price estimate.
+   * Used by `market-sold-comps-card-fetch` only; batch ingest omits this.
+   */
+  browseFallbackToken?: string;
+};
+
+/** Finding API diagnostics per finish (for debugging empty sold comps). */
+export type SoldCompFindingDiag = {
+  card_type: string;
+  query_preview: string;
+  sample_size: number;
+  raw?: Record<string, unknown>;
+  finding_attempt_raw?: Record<string, unknown>;
 };
 
 export type IngestOneCardSoldResult = {
   searches: number;
   rowsUpserted: number;
   errors: string[];
+  findingDiagnostics?: SoldCompFindingDiag[];
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** When Finding did not yield a persistable row, Browse may still estimate from active BIN. */
+function shouldTryFindingBrowseFallback(raw?: Record<string, unknown>): boolean {
+  if (!raw) return false;
+  const reason = String(raw.reason ?? "");
+  if (reason === "no_ebay_app_id") return false;
+  if (reason === "finding_api_price_parse_failed") return false;
+  if (reason.startsWith("finding_api_ack_error")) return false;
+  if (reason === "finding_api_no_items") return false;
+  return (
+    reason.startsWith("finding_api_http_error") ||
+    /ratelimiter|10001|rate.?limit/i.test(reason) ||
+    raw.diag_httpStatus === 500 ||
+    raw.diag_httpStatus === 429
+  );
+}
 
 /**
  * Run Finding sold-comps ingest for a single catalog card (all finishes with valid queries).
@@ -48,11 +83,13 @@ export async function ingestOneCardSoldComps(
   card: PokemonCardCompSource,
   options: IngestOneCardSoldOptions,
 ): Promise<IngestOneCardSoldResult> {
-  const { findingLimit, delayMs, recordSnapshots, refreshTier } = options;
+  const { findingLimit, delayMs, recordSnapshots, refreshTier, browseFallbackToken } =
+    options;
 
   let searches = 0;
   let rowsUpserted = 0;
   const errors: string[] = [];
+  const findingDiagnostics: SoldCompFindingDiag[] = [];
 
   const activeFinishes = cardHasTcgPricingScope(card)
     ? tcgplayerActiveFinishes(card)
@@ -101,7 +138,7 @@ export async function ingestOneCardSoldComps(
     if (refErr) {
       errors.push(`pokemon_card_market_refresh (sold): ${refErr.message}`);
     }
-    return { searches, rowsUpserted, errors };
+    return { searches, rowsUpserted, errors, findingDiagnostics };
   }
 
   for (const cardType of activeFinishes) {
@@ -126,6 +163,54 @@ export async function ingestOneCardSoldComps(
       continue;
     }
 
+    let resolved = sold;
+    const browseTok = browseFallbackToken?.trim();
+    if (
+      sold.raw?.ingestSoldRow !== true &&
+      browseTok &&
+      shouldTryFindingBrowseFallback(sold.raw)
+    ) {
+      try {
+        const bin = await fetchMarketCompsBrowse(
+          browseTok,
+          q,
+          Math.min(25, findingLimit),
+        );
+        if (bin.sampleSize > 0 && bin.averageCents != null) {
+          const br = bin.raw && typeof bin.raw === "object" && !Array.isArray(bin.raw)
+            ? (bin.raw as Record<string, unknown>)
+            : {};
+          resolved = {
+            averageCents: bin.averageCents,
+            sampleSize: bin.sampleSize,
+            raw: {
+              ...br,
+              ingestSoldRow: true,
+              source: "browse_bin_fallback",
+              findingFallbackReason: sold.raw?.reason,
+            },
+          };
+        }
+      } catch (e) {
+        errors.push(`${card.id} ${cardType} browse fallback: ${(e as Error).message}`);
+      }
+    }
+
+    findingDiagnostics.push({
+      card_type: String(cardType),
+      query_preview: q.slice(0, 120),
+      sample_size: resolved.sampleSize,
+      raw: resolved.raw,
+      finding_attempt_raw: sold.raw,
+    });
+
+    if (resolved.raw?.ingestSoldRow !== true) {
+      errors.push(
+        `${card.id} ${cardType}: ${String(resolved.raw?.reason ?? "finding_api_failed")}`,
+      );
+      continue;
+    }
+
     const nowIso = new Date().toISOString();
     const { data: soldRow, error: upErr } = await admin
       .from("market_sold_comps")
@@ -137,8 +222,8 @@ export async function ingestOneCardSoldComps(
           card_set: cardSet || null,
           pokemon_card_image_id: card.id,
           card_type: cardType,
-          average_price_cents: sold.averageCents,
-          sample_size: sold.sampleSize,
+          average_price_cents: resolved.averageCents,
+          sample_size: resolved.sampleSize,
           updated_at: nowIso,
         },
         { onConflict: "pokemon_card_image_id,card_type" },
@@ -156,8 +241,8 @@ export async function ingestOneCardSoldComps(
           card_type: String(cardType),
           market_sold_comp_id: soldRow?.id ?? null,
           search_query: q,
-          average_price_cents: sold.averageCents,
-          sample_size: sold.sampleSize,
+          average_price_cents: resolved.averageCents,
+          sample_size: resolved.sampleSize,
           ingested_at: nowIso,
         });
       }
@@ -171,6 +256,12 @@ export async function ingestOneCardSoldComps(
     if (snapErr) {
       errors.push(`market_sold_comp_snapshots: ${snapErr.message}`);
     }
+  }
+
+  // Do not advance sold refresh cursor when every Finding call failed (e.g. rate limit);
+  // avoids cooldown treating a failed run as a successful ingest.
+  if (searches > 0 && rowsUpserted === 0) {
+    return { searches, rowsUpserted, errors, findingDiagnostics };
   }
 
   const nowIso = new Date().toISOString();
@@ -189,5 +280,5 @@ export async function ingestOneCardSoldComps(
     errors.push(`pokemon_card_market_refresh (sold): ${refErr.message}`);
   }
 
-  return { searches, rowsUpserted, errors };
+  return { searches, rowsUpserted, errors, findingDiagnostics };
 }
