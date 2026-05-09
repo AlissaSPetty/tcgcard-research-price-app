@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import App from "./App";
+import { PersistHydrationGate } from "./PersistHydrationGate";
 import { initThemeFromStorage } from "./theme";
 import { queryClient, queryPersister } from "./queryClient";
 import "./styles.css";
@@ -17,9 +18,11 @@ if (el) {
         client={queryClient}
         persistOptions={{ persister: queryPersister, maxAge: 1000 * 60 * 60 * 24 }}
       >
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
+        <PersistHydrationGate>
+          <BrowserRouter>
+            <App />
+          </BrowserRouter>
+        </PersistHydrationGate>
       </PersistQueryClientProvider>
     </StrictMode>,
   );

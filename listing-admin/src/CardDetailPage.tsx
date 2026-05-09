@@ -1,13 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
-import { createClient } from "@supabase/supabase-js";
 import { applyThemeToDocument, type Theme } from "./theme";
 import { tcgplayerActiveFinishes, type TcgFinish } from "./tcgFinishScope";
-
-const url = import.meta.env.VITE_SUPABASE_URL ?? "";
-const anon = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
-const supabase = createClient(url, anon);
+import { supabase, supabaseAnonKey, supabaseUrl } from "./supabaseClient";
 
 type PokemonCardImageRow = {
   id: string;
@@ -248,6 +244,13 @@ type SoldFetchResponse = {
   rows?: MarketSoldCompRow[];
   errors?: string[];
   error?: string;
+  searches?: number;
+  findingDiagnostics?: Array<{
+    card_type: string;
+    query_preview: string;
+    sample_size: number;
+    raw?: Record<string, unknown>;
+  }>;
 };
 
 export type CardDetailPageProps = {
@@ -454,6 +457,35 @@ export default function CardDetailPage({
           fetchedAt: payload.fetchedAt ?? null,
           cached: Boolean(payload.cached),
         });
+        // #region agent log
+        fetch("http://127.0.0.1:7778/ingest/88db9006-aa01-456d-84ff-fc395f94e133", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Debug-Session-Id": "deb939",
+          },
+          body: JSON.stringify({
+            sessionId: "deb939",
+            hypothesisId: "H1-H5",
+            location: "CardDetailPage.tsx:fetchSoldComps",
+            message: "market-sold-comps-card-fetch response",
+            data: {
+              force,
+              cached: Boolean(payload.cached),
+              rowSummaries: (payload.rows ?? []).map((r) => ({
+                card_type: r.card_type,
+                n: r.sample_size,
+                cents: r.average_price_cents,
+              })),
+              findingDiagnostics: payload.findingDiagnostics,
+              errors: payload.errors,
+              searches: payload.searches,
+            },
+            timestamp: Date.now(),
+            runId: "post-fix",
+          }),
+        }).catch(() => {});
+        // #endregion
         if (payload.cached) {
           const m = payload.cooldownMinutes ?? 60;
           setSoldCachedNotice(
@@ -461,7 +493,7 @@ export default function CardDetailPage({
           );
         }
         const errs = payload.errors?.filter(Boolean);
-        if (errs && errs.length > 0 && !(payload.rows && payload.rows.length > 0)) {
+        if (errs && errs.length > 0) {
           setSoldError(errs.join("; "));
         }
       } finally {
@@ -507,7 +539,7 @@ export default function CardDetailPage({
   const binShowSkeleton = binLoading && fetchedMeta === null;
   const binShowOverlay = binLoading && fetchedMeta !== null;
 
-  if (!url || !anon) {
+  if (!supabaseUrl || !supabaseAnonKey) {
     return (
       <p className="error">
         Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY for this app.
