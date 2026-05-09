@@ -1,49 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { createClient, type Session } from "@supabase/supabase-js";
+import type { Session } from "@supabase/supabase-js";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { applyThemeToDocument, type Theme } from "./theme";
 import { tcgplayerActiveFinishes, type TcgFinish } from "./tcgFinishScope";
-
-const url = import.meta.env.VITE_SUPABASE_URL ?? "";
-const anon = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
-const supabase = createClient(url, anon);
-
-type PokemonCardImageRow = {
-  id: string;
-  tcgplayer_product_id: number;
-  tcgplayer_price_cents: number | null;
-  /** tcgcsv `/prices` rows keyed by subTypeName (see catalog ingest). */
-  tcgplayer_prices_by_finish: Record<string, unknown> | null;
-  name: string;
-  image_url: string | null;
-  holo_image_url: string | null;
-  reverse_holo_image_url: string | null;
-  /** tcgcsv group code prefix (letters before trailing digits), e.g. ME; join pokemon_series_display for label. */
-  series: string | null;
-  card_set: string | null;
-  details: string | null;
-  rarity: string | null;
-  artist: string | null;
-  card_number: string | null;
-  created_at: string;
-  updated_at: string;
-  /** Max `market_rss_cards.updated_at` for this card (all finishes). */
-  last_market_comp_at: string | null;
-  /** Max `market_sold_comps.updated_at` for this card (all finishes). */
-  last_sold_comp_at: string | null;
-  /** Largest |Δmarket| among TCGplayer snapshot finishes vs previous catalog ingest. */
-  tcgplayer_card_max_abs_price_delta_cents: number | null;
-  /** Sign of that largest TCGplayer snapshot move. */
-  tcgplayer_card_price_delta_sign: number | null;
-  tcgplayer_delta_normal_cents: number | null;
-  tcgplayer_delta_holo_cents: number | null;
-  tcgplayer_delta_reverse_holo_cents: number | null;
-  /** Digits before `/` in card_number for numeric sort (view). */
-  card_number_sort_primary: number | null;
-  /** Digits after `/` for numeric sort (view). */
-  card_number_sort_secondary: number | null;
-};
+import {
+  fetchListingCatalogStatus,
+  LISTING_CATALOG_STATUS_QUERY_KEY,
+  type CatalogStatusRow,
+} from "./listingCatalogStatus";
+import {
+  POKEMON_CARDS_PAGE_SIZE,
+  EMPTY_POKEMON_CARD_FILTERS,
+  fetchPokemonDashboardGrid,
+  type PokemonCardImageRow,
+  type PokemonCardFilters,
+  type DashboardGridQueryResult,
+} from "./pokemonDashboardGridFetch";
+import { supabase, supabaseAnonKey, supabaseUrl } from "./supabaseClient";
 
 type MarketSoldCompRow = {
   id: string;
@@ -54,36 +28,6 @@ type MarketSoldCompRow = {
   updated_at: string;
 };
 
-type PokemonCardFilters = {
-  name: string;
-  series: string;
-  card_set: string;
-  card_number: string;
-  rarity: string;
-  artist: string;
-};
-
-type DashboardGridQueryResult = {
-  rows: PokemonCardImageRow[];
-  total: number;
-};
-
-type CatalogStatusRow = {
-  generation: number;
-  ingest_running: boolean;
-};
-
-/** All filters empty (e.g. after “Clear filters”). */
-const EMPTY_POKEMON_CARD_FILTERS: PokemonCardFilters = {
-  name: "",
-  series: "",
-  card_set: "",
-  card_number: "",
-  rarity: "",
-  artist: "",
-};
-
-const POKEMON_CARDS_PAGE_SIZE = 30;
 /** When no catalog filters are applied, pagination UI is limited to this many pages. */
 const MAX_DASHBOARD_PAGES_UNFILTERED = 50;
 /** Column headers = marketplace (BIN comps live on card detail page only). */
@@ -102,30 +46,6 @@ function ilikeContainsPattern(raw: string): string | null {
   const safe = t.replace(/[%_\\]/g, "");
   if (!safe) return null;
   return `%${safe}%`;
-}
-
-/** PostgREST RPC: `string[]` (setof text) or `{ series?: string }[]` / `{ card_set?: string }[]` (returns table). */
-function rpcDistinctStrings(data: unknown): string[] {
-  if (data == null) return [];
-  if (!Array.isArray(data)) return [];
-  const out: string[] = [];
-  for (const item of data) {
-    if (typeof item === "string") {
-      const t = item.trim();
-      if (t) out.push(t);
-    } else if (item && typeof item === "object") {
-      for (const v of Object.values(item as Record<string, unknown>)) {
-        if (typeof v === "string") {
-          const t = v.trim();
-          if (t) {
-            out.push(t);
-            break;
-          }
-        }
-      }
-    }
-  }
-  return out;
 }
 
 type ReleaseSortRow = { name: string; t: number | null };
@@ -367,22 +287,21 @@ export default function PokemonDashboard({
   );
   const pokemonCardFiltersRef = useRef(pokemonCardFilters);
   pokemonCardFiltersRef.current = pokemonCardFilters;
-  /** True after series filter options have loaded (or failed); gates first `loadPokemonCards`. */
-  const [pokemonFilterBootstrapped, setPokemonFilterBootstrapped] = useState(false);
+  const pokemonCardsPageRef = useRef(pokemonCardsPage);
+  pokemonCardsPageRef.current = pokemonCardsPage;
+  const gridQueryDataRef = useRef<DashboardGridQueryResult | undefined>(undefined);
+  const pendingListingCatalogMetaRef = useRef<Partial<CatalogStatusRow> | null>(null);
+  const [frozenGridSnapshot, setFrozenGridSnapshot] = useState<DashboardGridQueryResult | null>(
+    null,
+  );
+  const hotSoldRefreshSentRef = useRef(false);
   const [pokemonIngestBusy, setPokemonIngestBusy] = useState(false);
   const [pokemonIngestStatus, setPokemonIngestStatus] = useState("");
-  const [catalogGeneration, setCatalogGeneration] = useState<number | null>(null);
-  const [ingestRunning, setIngestRunning] = useState(false);
   const [soldCompsByKey, setSoldCompsByKey] = useState<
     Record<string, MarketSoldCompRow>
   >({});
-  /** Filter value = `series` (prefix); label from TCGdex when available. */
-  const [seriesFilterRows, setSeriesFilterRows] = useState<
-    { series: string; label: string }[]
-  >([]);
   const [cardSetOptions, setCardSetOptions] = useState<string[]>([]);
   const [cardSetOptionsLoading, setCardSetOptionsLoading] = useState(false);
-  const [rarityOptions, setRarityOptions] = useState<string[]>([]);
   /** Per-cell expand: e.g. `${cardId}::${finish}::ebay-listed` */
   const [compBreakdownOpen, setCompBreakdownOpen] = useState<Record<string, boolean>>({});
   /** Bumps on an interval so “Xm ago” labels stay current (re-render only). */
@@ -415,29 +334,6 @@ export default function PokemonDashboard({
     },
     [session],
   );
-
-  const loadSeries = useCallback(async () => {
-    if (!session) return;
-    const { data, error: e } = await supabase.rpc("list_distinct_pokemon_series");
-    if (e) {
-      setError(e.message);
-      setPokemonFilterBootstrapped(true);
-      return;
-    }
-    const seriesRows = seriesFilterRowsFromRpc(data);
-    setSeriesFilterRows(seriesRows);
-    setPokemonFilterBootstrapped(true);
-  }, [session]);
-
-  const loadRarities = useCallback(async () => {
-    if (!session) return;
-    const { data, error: e } = await supabase.rpc("list_distinct_pokemon_card_rarities");
-    if (e) {
-      setError(e.message);
-      return;
-    }
-    setRarityOptions(rpcDistinctStrings(data));
-  }, [session]);
 
   const updatePokemonCardFilter = useCallback(
     <K extends keyof PokemonCardFilters>(key: K, value: string) => {
@@ -507,6 +403,30 @@ export default function PokemonDashboard({
     [],
   );
 
+  const catalogStatusQuery = useQuery({
+    queryKey: LISTING_CATALOG_STATUS_QUERY_KEY,
+    enabled: Boolean(sessionUserId),
+    refetchOnWindowFocus: false,
+    queryFn: fetchListingCatalogStatus,
+  });
+
+  const catalogGeneration = catalogStatusQuery.data?.generation ?? null;
+  const ingestRunning = catalogStatusQuery.data?.ingest_running ?? false;
+
+  const seriesQuery = useQuery({
+    queryKey: ["pokemon-dashboard-series-options"],
+    enabled: Boolean(sessionUserId),
+    staleTime: 1000 * 60 * 30,
+    queryFn: async () => {
+      const { data, error: e } = await supabase.rpc("list_distinct_pokemon_series");
+      if (e) throw e;
+      return seriesFilterRowsFromRpc(data);
+    },
+  });
+
+  const seriesFilterRows = seriesQuery.data ?? [];
+  const pokemonFilterBootstrapped = seriesQuery.isFetched;
+
   const hotIdsQuery = useQuery({
     queryKey: ["pokemon-dashboard-hot-ids", catalogGeneration ?? "ungated"],
     queryFn: async () => (await fetchHotMoverCardIds()) ?? [],
@@ -516,87 +436,29 @@ export default function PokemonDashboard({
 
   const gridQuery = useQuery({
     queryKey: gridQueryKeyFor(pokemonCardsPage, pokemonCardFilters, catalogGeneration),
-    enabled: Boolean(sessionUserId && pokemonFilterBootstrapped),
+    enabled: Boolean(sessionUserId),
     staleTime: 1000 * 60 * 5,
-    queryFn: async (): Promise<DashboardGridQueryResult> => {
-      const page = pokemonCardsPage;
-      const filters = pokemonCardFilters;
-      const from = (page - 1) * POKEMON_CARDS_PAGE_SIZE;
-      const to = from + POKEMON_CARDS_PAGE_SIZE - 1;
-      let q = supabase
-        .from("pokemon_card_images_with_market_activity")
-        .select(
-          "id, tcgplayer_product_id, tcgplayer_price_cents, tcgplayer_prices_by_finish, name, image_url, holo_image_url, reverse_holo_image_url, series, card_set, details, rarity, artist, card_number, created_at, updated_at, last_market_comp_at, last_sold_comp_at, tcgplayer_card_max_abs_price_delta_cents, tcgplayer_card_price_delta_sign, tcgplayer_delta_normal_cents, tcgplayer_delta_holo_cents, tcgplayer_delta_reverse_holo_cents, card_number_sort_primary, card_number_sort_secondary",
-          { count: "exact" },
-        );
-      q = q.not("card_number", "is", null).neq("card_number", "");
-      const addIlike = (
-        column: keyof Pick<PokemonCardImageRow, "name" | "card_number" | "artist">,
-        value: string,
-      ) => {
-        const pat = ilikeContainsPattern(value);
-        if (pat) q = q.ilike(column, pat);
-      };
-      addIlike("name", filters.name);
-      const seriesPick = filters.series.trim();
-      const setPick = filters.card_set.trim();
-      const nameSearchSpansCatalog = ilikeContainsPattern(filters.name) != null;
-      const effectiveSeries = nameSearchSpansCatalog ? "" : seriesPick;
-      const effectiveSet = nameSearchSpansCatalog ? "" : setPick;
-      if (effectiveSeries) q = q.eq("series", effectiveSeries);
-      if (effectiveSet) q = q.eq("card_set", effectiveSet);
-      addIlike("card_number", filters.card_number);
-      const rarityPick = filters.rarity.trim();
-      if (rarityPick) q = q.eq("rarity", rarityPick);
-      addIlike("artist", filters.artist);
-      const unfiltered =
-        !filters.name.trim() &&
-        !filters.series.trim() &&
-        !filters.card_set.trim() &&
-        !filters.card_number.trim() &&
-        !filters.rarity.trim() &&
-        !filters.artist.trim();
-      const hotIds = hotIdsQuery.data ?? [];
-      if (unfiltered && hotIds.length > 0) {
-        const list = hotIds.map((id) => `'${id}'`).join(",");
-        q = q.not("id", "in", `(${list})`);
-      }
-      const seriesAndSet = Boolean(effectiveSeries && effectiveSet);
-      let ordered = q;
-      if (seriesAndSet) {
-        ordered = q
-          .order("card_number_sort_primary", { ascending: true, nullsFirst: false })
-          .order("card_number_sort_secondary", { ascending: true, nullsFirst: false })
-          .order("name", { ascending: true });
-      } else {
-        ordered = q.order("tcgplayer_card_max_abs_price_delta_cents", {
-          ascending: false,
-          nullsFirst: false,
-        });
-        if (setPick) {
-          ordered = ordered
-            .order("card_number_sort_primary", { ascending: true, nullsFirst: false })
-            .order("card_number_sort_secondary", { ascending: true, nullsFirst: false });
-        } else {
-          ordered = ordered.order("name", { ascending: true });
-        }
-      }
-      const { data, error: e, count } = await ordered.range(from, to);
-      if (e) throw e;
-      return { rows: (data ?? []) as PokemonCardImageRow[], total: count ?? 0 };
-    },
+    queryFn: () =>
+      fetchPokemonDashboardGrid({
+        page: pokemonCardsPage,
+        filters: pokemonCardFilters,
+        hotIds: hotIdsQuery.data ?? [],
+      }),
   });
+
+  const visibleGridData: DashboardGridQueryResult | undefined =
+    frozenGridSnapshot !== null ? frozenGridSnapshot : (gridQuery.data ?? undefined);
 
   const soldCompsQuery = useQuery({
     queryKey: [
       "pokemon-dashboard-sold-comps",
       catalogGeneration ?? "ungated",
-      (gridQuery.data?.rows ?? []).map((r) => r.id).join(","),
+      (visibleGridData?.rows ?? []).map((r) => r.id).join(","),
     ],
-    enabled: Boolean(sessionUserId && (gridQuery.data?.rows?.length ?? 0) > 0),
+    enabled: Boolean(sessionUserId && (visibleGridData?.rows?.length ?? 0) > 0),
     staleTime: 60_000,
     queryFn: async () => {
-      const ids = (gridQuery.data?.rows ?? []).map((r) => r.id);
+      const ids = (visibleGridData?.rows ?? []).map((r) => r.id);
       return (await fetchSoldMarketCompsForIds(ids)) ?? {};
     },
   });
@@ -611,25 +473,95 @@ export default function PokemonDashboard({
 
   const loadPokemonCardsRef = useRef(loadPokemonCards);
   loadPokemonCardsRef.current = loadPokemonCards;
-  const ingestRunningRef = useRef(ingestRunning);
-  ingestRunningRef.current = ingestRunning;
+  const ingestRunningRef = useRef(false);
 
-  const catalogStatusQuery = useQuery({
-    queryKey: ["listing-catalog-status"],
-    enabled: Boolean(sessionUserId),
-    refetchOnWindowFocus: false,
-    queryFn: async (): Promise<CatalogStatusRow | null> => {
-      const { data, error: rpcErr } = await supabase.rpc("listing_catalog_status");
-      if (rpcErr) return null;
-      const row = Array.isArray(data) ? data[0] : null;
-      if (!row || typeof row !== "object") return null;
-      const rec = row as { generation?: number; ingest_running?: boolean };
-      if (typeof rec.generation !== "number" || typeof rec.ingest_running !== "boolean") {
-        return null;
+  const prefetchDashboardQueries = useCallback(async () => {
+    const status = queryClient.getQueryData<CatalogStatusRow | null>(
+      LISTING_CATALOG_STATUS_QUERY_KEY,
+    );
+    const gen = status?.generation ?? null;
+    await queryClient.prefetchQuery({
+      queryKey: ["pokemon-dashboard-hot-ids", gen ?? "ungated"],
+      queryFn: async () => (await fetchHotMoverCardIds()) ?? [],
+      staleTime: 1000 * 60 * 5,
+    });
+    const hotIds =
+      queryClient.getQueryData<string[]>(["pokemon-dashboard-hot-ids", gen ?? "ungated"]) ?? [];
+    await queryClient.prefetchQuery({
+      queryKey: gridQueryKeyFor(pokemonCardsPageRef.current, pokemonCardFiltersRef.current, gen),
+      queryFn: () =>
+        fetchPokemonDashboardGrid({
+          page: pokemonCardsPageRef.current,
+          filters: pokemonCardFiltersRef.current,
+          hotIds,
+        }),
+      staleTime: 1000 * 60 * 5,
+    });
+  }, [queryClient, fetchHotMoverCardIds, gridQueryKeyFor]);
+
+  useEffect(() => {
+    ingestRunningRef.current = ingestRunning;
+  }, [ingestRunning]);
+
+  useEffect(() => {
+    gridQueryDataRef.current = gridQuery.data;
+  }, [gridQuery.data]);
+
+  useEffect(() => {
+    setFrozenGridSnapshot(null);
+  }, [pokemonCardsPage, pokemonCardFilters]);
+
+  useEffect(() => {
+    const p = pendingListingCatalogMetaRef.current;
+    if (!p) return;
+    if (p.generation === undefined && p.ingest_running === undefined) return;
+    queryClient.setQueryData<CatalogStatusRow | null>(
+      LISTING_CATALOG_STATUS_QUERY_KEY,
+      (old) => {
+        const base = old ?? { generation: 0, ingest_running: false };
+        return {
+          generation: typeof p.generation === "number" ? p.generation : base.generation,
+          ingest_running:
+            typeof p.ingest_running === "boolean" ? p.ingest_running : base.ingest_running,
+        };
+      },
+    );
+    pendingListingCatalogMetaRef.current = null;
+  }, [pokemonCardsPage, pokemonCardFilters, queryClient]);
+
+  useEffect(() => {
+    if (seriesQuery.error) setError((seriesQuery.error as Error).message);
+  }, [seriesQuery.error]);
+
+  useEffect(() => {
+    if (!sessionUserId) return;
+    const ids = hotIdsQuery.data ?? [];
+    if (ids.length === 0) return;
+    if (hotSoldRefreshSentRef.current) return;
+    hotSoldRefreshSentRef.current = true;
+    void (async () => {
+      const {
+        data: { session: s },
+      } = await supabase.auth.getSession();
+      if (!s) return;
+      try {
+        await fetch(
+          `${supabaseUrl.replace(/\/$/, "")}/functions/v1/market-sold-comps-hot-refresh`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${s.access_token}`,
+              apikey: supabaseAnonKey,
+            },
+            body: JSON.stringify({ pokemon_card_image_ids: ids }),
+          },
+        );
+      } catch {
+        /* ignore */
       }
-      return { generation: rec.generation, ingest_running: rec.ingest_running };
-    },
-  });
+    })();
+  }, [sessionUserId, hotIdsQuery.data]);
 
   const loadSafeAccount = useCallback(async () => {
     const { data } = await supabase.from("lp_ebay_accounts_safe").select("*").maybeSingle();
@@ -666,27 +598,16 @@ export default function PokemonDashboard({
     setSoldCompsByKey(soldCompsQuery.data);
   }, [soldCompsQuery.data]);
 
-  const pokemonCards = gridQuery.data?.rows ?? [];
-  const pokemonCardsTotal = gridQuery.data?.total ?? 0;
-  const pokemonCardsLoading =
-    !pokemonFilterBootstrapped || gridQuery.isFetching || soldCompsQuery.isFetching;
+  const pokemonCards = visibleGridData?.rows ?? [];
+  const pokemonCardsTotal = visibleGridData?.total ?? 0;
+  const catalogAwaitingFirstPaint =
+    gridQuery.isPending && frozenGridSnapshot === null && gridQuery.data === undefined;
+  const filterOptionsLoading = seriesQuery.isPending;
   useEffect(() => {
     setCompBreakdownOpen({});
   }, [pokemonCardsPage, pokemonCardFilters, catalogGeneration]);
 
-  useEffect(() => {
-    void loadSeries();
-    void loadRarities();
-  }, [loadSeries, loadRarities]);
-
-  useEffect(() => {
-    const status = catalogStatusQuery.data;
-    if (!status) return;
-    setCatalogGeneration(status.generation);
-    setIngestRunning(status.ingest_running);
-  }, [catalogStatusQuery.data]);
-
-  /** market_rss_cards events only refetch grid rows (series/set/rarity reloads are intentionally excluded). */
+  /** market_rss_cards: prefetch fresh grid/hot data without swapping the frozen on-screen snapshot. */
   useEffect(() => {
     let debounce: ReturnType<typeof setTimeout> | null = null;
     const schedule = () => {
@@ -694,8 +615,9 @@ export default function PokemonDashboard({
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
         debounce = null;
-        void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-grid"] });
-        void loadPokemonCardsRef.current({ silent: true });
+        const snap = gridQueryDataRef.current;
+        setFrozenGridSnapshot((prev) => prev ?? snap ?? null);
+        void prefetchDashboardQueries();
       }, 2500);
     };
     const ch = supabase
@@ -710,7 +632,7 @@ export default function PokemonDashboard({
       if (debounce) clearTimeout(debounce);
       void supabase.removeChannel(ch);
     };
-  }, [queryClient]);
+  }, [queryClient, prefetchDashboardQueries]);
 
   /** Sold comps are cell-only updates; keep card ordering + filters unchanged. */
   useEffect(() => {
@@ -742,17 +664,30 @@ export default function PokemonDashboard({
             | { tcgcsv_ingest_running?: boolean; tcgcsv_catalog_generation?: number }
             | undefined;
           if (!next) return;
-          if (typeof next.tcgcsv_catalog_generation === "number") {
-            setCatalogGeneration(next.tcgcsv_catalog_generation);
-          }
+          pendingListingCatalogMetaRef.current = {
+            ...(pendingListingCatalogMetaRef.current ?? {}),
+            ...(typeof next.tcgcsv_catalog_generation === "number"
+              ? { generation: next.tcgcsv_catalog_generation }
+              : {}),
+            ...(typeof next.tcgcsv_ingest_running === "boolean"
+              ? { ingest_running: next.tcgcsv_ingest_running }
+              : {}),
+          };
+          const wasRunning = ingestRunningRef.current;
           if (typeof next.tcgcsv_ingest_running === "boolean") {
-            const wasRunning = ingestRunningRef.current;
-            setIngestRunning(next.tcgcsv_ingest_running);
-            if (wasRunning && !next.tcgcsv_ingest_running) {
-              void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-grid"] });
-              void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-hot-ids"] });
-              void loadPokemonCardsRef.current({ silent: true });
-            }
+            ingestRunningRef.current = next.tcgcsv_ingest_running;
+          }
+          if (
+            wasRunning &&
+            typeof next.tcgcsv_ingest_running === "boolean" &&
+            !next.tcgcsv_ingest_running
+          ) {
+            const snap = gridQueryDataRef.current;
+            setFrozenGridSnapshot((prev) => prev ?? snap ?? null);
+            void queryClient.invalidateQueries({
+              queryKey: ["pokemon-dashboard-series-options"],
+            });
+            void prefetchDashboardQueries();
           }
         },
       )
@@ -760,7 +695,7 @@ export default function PokemonDashboard({
     return () => {
       void supabase.removeChannel(ch);
     };
-  }, [queryClient]);
+  }, [queryClient, prefetchDashboardQueries]);
 
   const pokemonFiltersActive = useMemo(
     () => Object.values(pokemonCardFilters).some((v) => v.trim() !== ""),
@@ -816,7 +751,7 @@ export default function PokemonDashboard({
       return;
     }
 
-    const base = url.replace(/\/$/, "");
+    const base = supabaseUrl.replace(/\/$/, "");
     const fnUrl = `${base}/functions/v1/pokemon-card-images-ingest`;
 
     setPokemonIngestBusy(true);
@@ -886,11 +821,12 @@ export default function PokemonDashboard({
       setPokemonIngestStatus(
         `Finished ${batch} batch(es), ~${totalRows} row upserts. The list updates automatically.${warnSuffix}`,
       );
+      setFrozenGridSnapshot(null);
+      void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-series-options"] });
+      void queryClient.invalidateQueries({ queryKey: LISTING_CATALOG_STATUS_QUERY_KEY });
       void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-grid"] });
       void queryClient.invalidateQueries({ queryKey: ["pokemon-dashboard-hot-ids"] });
-      void loadSeries();
       void loadCardSetsForSeries(pokemonCardFiltersRef.current.series);
-      void loadRarities();
       void loadPokemonCards();
     } finally {
       setPokemonIngestBusy(false);
@@ -934,7 +870,7 @@ export default function PokemonDashboard({
     void loadSafeAccount();
   }
 
-  if (!url || !anon) {
+  if (!supabaseUrl || !supabaseAnonKey) {
     return (
       <p className="error">
         Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY for this app.
@@ -1056,6 +992,7 @@ export default function PokemonDashboard({
             <label>Series</label>
             <select
               value={pokemonCardFilters.series}
+              disabled={!pokemonFilterBootstrapped}
               onChange={(e) => updatePokemonSeriesFilter(e.target.value)}
               aria-label="Series (required for set list)"
             >
@@ -1074,7 +1011,9 @@ export default function PokemonDashboard({
             <select
               value={pokemonCardFilters.card_set}
               disabled={
-                !pokemonCardFilters.series.trim() || cardSetOptionsLoading
+                !pokemonFilterBootstrapped ||
+                !pokemonCardFilters.series.trim() ||
+                cardSetOptionsLoading
               }
               title={
                 !pokemonCardFilters.series.trim()
@@ -1109,29 +1048,6 @@ export default function PokemonDashboard({
               autoComplete="off"
             />
           </div>
-          <div>
-            <label>Rarity</label>
-            <select
-              value={pokemonCardFilters.rarity}
-              onChange={(e) => updatePokemonCardFilter("rarity", e.target.value)}
-            >
-              <option value="">All rarities</option>
-              {rarityOptions.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label>Artist</label>
-            <input
-              value={pokemonCardFilters.artist}
-              onChange={(e) => updatePokemonCardFilter("artist", e.target.value)}
-              placeholder="Artist name"
-              autoComplete="off"
-            />
-          </div>
           <div className="filter-actions">
             <button
               type="button"
@@ -1149,14 +1065,13 @@ export default function PokemonDashboard({
           </div>
         </div>
         </div>
-        {(!pokemonFilterBootstrapped || pokemonCardsLoading) && (
-          <p className="text-muted text-sm" style={{ marginBottom: "1rem" }}>
-            {!pokemonFilterBootstrapped
-              ? "Loading filter options…"
-              : "Loading catalog and sold comps…"}
-          </p>
+        {(filterOptionsLoading || catalogAwaitingFirstPaint) && (
+          <div className="text-muted text-sm" style={{ marginBottom: "1rem" }}>
+            {filterOptionsLoading && <p>Loading filter options…</p>}
+            {catalogAwaitingFirstPaint && <p>Loading catalog…</p>}
+          </div>
         )}
-        {pokemonFilterBootstrapped && !pokemonCardsLoading && (
+        {!catalogAwaitingFirstPaint && visibleGridData !== undefined && (
         <div className="pokemon-card-grid">
           {pokemonCards.map((c) => {
             const finishes = tcgplayerActiveFinishes({
@@ -1369,7 +1284,7 @@ export default function PokemonDashboard({
           })}
         </div>
         )}
-        {pokemonFilterBootstrapped && pokemonCardsTotal > 0 && !pokemonCardsLoading && (
+        {!catalogAwaitingFirstPaint && pokemonCardsTotal > 0 && visibleGridData !== undefined && (
           <div className="pagination-bar">
             <span className="tabular-nums">
               {(pokemonCardsPageSafe - 1) * POKEMON_CARDS_PAGE_SIZE + 1}–
@@ -1382,7 +1297,7 @@ export default function PokemonDashboard({
             <button
               type="button"
               className="secondary"
-              disabled={pokemonCardsPageSafe <= 1 || pokemonCardsLoading}
+              disabled={pokemonCardsPageSafe <= 1 || catalogAwaitingFirstPaint || gridQuery.isFetching}
               onClick={() => setPokemonCardsPage((p) => Math.max(1, p - 1))}
             >
               Previous
@@ -1394,7 +1309,7 @@ export default function PokemonDashboard({
                   id="pokemon-cards-page"
                   className="pagination-page-select"
                   value={pokemonCardsPageSafe}
-                  disabled={pokemonCardsLoading}
+                  disabled={catalogAwaitingFirstPaint || gridQuery.isFetching}
                   onChange={(e) => setPokemonCardsPage(Number(e.target.value))}
                   aria-label={`Page, ${pokemonCardsTotalPages} total`}
                 >
@@ -1417,7 +1332,9 @@ export default function PokemonDashboard({
               type="button"
               className="secondary"
               disabled={
-                pokemonCardsPageSafe >= pokemonCardsTotalPages || pokemonCardsLoading
+                pokemonCardsPageSafe >= pokemonCardsTotalPages ||
+                catalogAwaitingFirstPaint ||
+                gridQuery.isFetching
               }
               onClick={() =>
                 setPokemonCardsPage((p) => Math.min(pokemonCardsTotalPages, p + 1))
@@ -1427,7 +1344,7 @@ export default function PokemonDashboard({
             </button>
           </div>
         )}
-        {pokemonFilterBootstrapped && pokemonCardsTotal === 0 && !pokemonCardsLoading && (
+        {!catalogAwaitingFirstPaint && pokemonCardsTotal === 0 && visibleGridData !== undefined && (
           <p className="empty-state">
             {pokemonFiltersActive
               ? "No cards match the current filters."

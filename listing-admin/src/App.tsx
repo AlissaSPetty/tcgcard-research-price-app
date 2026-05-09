@@ -1,15 +1,16 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Routes, Route } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
-import { createClient } from "@supabase/supabase-js";
 import { applyThemeToDocument, type Theme } from "./theme";
+import { fetchListingCatalogStatus, LISTING_CATALOG_STATUS_QUERY_KEY } from "./listingCatalogStatus";
+import { queryClient } from "./queryClient";
+import { supabase } from "./supabaseClient";
+import PokemonDashboard from "./PokemonDashboard";
 
-const PokemonDashboard = lazy(() => import("./PokemonDashboard"));
 const CardDetailPage = lazy(() => import("./CardDetailPage"));
 
 const url = import.meta.env.VITE_SUPABASE_URL ?? "";
 const anon = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
-const supabase = createClient(url, anon);
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>(() => {
@@ -36,6 +37,14 @@ export default function App() {
     } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
     return () => subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (!session?.user?.id) return;
+    void queryClient.prefetchQuery({
+      queryKey: LISTING_CATALOG_STATUS_QUERY_KEY,
+      queryFn: fetchListingCatalogStatus,
+    });
+  }, [session?.user?.id]);
 
   async function signIn(ev: React.FormEvent) {
     ev.preventDefault();
